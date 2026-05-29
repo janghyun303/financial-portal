@@ -228,6 +228,10 @@ const db = {
 
   // ── 로그인
   login: async (email, password) => {
+    // 어드민 계정 하드코딩 폴백 (Supabase DB에 없는 경우 대비)
+    if (email === "admin@cpa.com" && password === "admin1234") {
+      return { ok:true, user:{ id:99, name:"관리자", email:"admin@cpa.com", role:"admin", status:"approved", phone:"", businesses:[] } };
+    }
     const rows = await supaGet("users", `email=eq.${encodeURIComponent(email)}&password=eq.${encodeURIComponent(password)}&select=*`);
     if (!rows?.length) return { ok:false, msg:"이메일 또는 비밀번호가 올바르지 않습니다." };
     const u = rows[0];
@@ -679,36 +683,7 @@ function Login({ onLogin, onGo }) {
 
       </div>
 
-      {/* 좌측 브랜드 패널 — PC 전용 */}
-      {!isMobile && (
-        <div style={{
-          flex:"0 0 420px",display:"flex",flexDirection:"column",
-          justifyContent:"center",padding:"60px 56px",
-          borderRight:"1px solid rgba(201,168,76,0.15)",
-        }}>
-          <div style={{display:"flex",alignItems:"center",gap:"14px",marginBottom:"56px"}}>
-            <div style={{width:"44px",height:"44px",borderRadius:"10px",background:`linear-gradient(145deg,${T.gold},#A8843A)`,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 4px 16px rgba(201,168,76,0.3)",flexShrink:0}}>
-              <Icon name="logo" size={20} color="#fff" strokeWidth={2.5}/>
-            </div>
-            <div>
-              <div style={{color:"#fff",fontWeight:"800",fontSize:"15px",letterSpacing:"-0.5px",lineHeight:1.2}}>현 회계사의 고객 전용<br/>재무정보 조회 시스템</div>
-              <div style={{color:T.gold,fontSize:"11px",fontWeight:"600",letterSpacing:"1px",textTransform:"uppercase",marginTop:"2px"}}>Financial Portal</div>
-            </div>
-          </div>
-          <h2 style={{color:"#fff",fontSize:"30px",fontWeight:"800",margin:"0 0 16px",letterSpacing:"-1px",lineHeight:1.25}}>
-            고객 전용<br/>재무정보 조회 시스템
-          </h2>
-          <p style={{color:"rgba(255,255,255,0.5)",fontSize:"14px",lineHeight:"1.8",margin:"0 0 48px"}}>
-            재무상태표, 손익계산서, 부가세 및<br/>법인세 신고 내역을 안전하게 조회하세요.
-          </p>
-          {["실시간 재무제표 조회","전년도 비교 분석","세금 납부 일정 관리","PDF 출력 지원"].map(item=>(
-            <div key={item} style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"12px"}}>
-              <span style={{width:"6px",height:"6px",borderRadius:"50%",background:T.gold,flexShrink:0}}/>
-              <span style={{color:"rgba(255,255,255,0.6)",fontSize:"13px"}}>{item}</span>
-            </div>
-          ))}
-        </div>
-      )}
+
 
       {/* 로그인 폼 — 모바일은 전체, PC는 우측 */}
       <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",padding:isMobile?"24px 20px":"40px 24px"}}>
@@ -720,7 +695,7 @@ function Login({ onLogin, onGo }) {
                 <Icon name="logo" size={16} color="#fff" strokeWidth={2.5}/>
               </div>
               <div style={{textAlign:"left"}}>
-                <div style={{color:"#fff",fontWeight:"800",fontSize:"14px",letterSpacing:"-0.5px",lineHeight:1.2}}>현 회계사의 고객 전용<br/>재무정보 조회 시스템</div>
+                <div style={{color:"#fff",fontWeight:"800",fontSize:"14px",letterSpacing:"-0.5px",lineHeight:1.2}}>고객 전용<br/>재무정보 조회 시스템</div>
                 <div style={{color:T.gold,fontSize:"10px",fontWeight:"600",letterSpacing:"1px",textTransform:"uppercase"}}>Financial Portal</div>
               </div>
             </div>
@@ -2161,7 +2136,7 @@ function CustomerDash({ user, onLogout }) {
               <Icon name="logo" size={14} color="#fff" strokeWidth={2.5}/>
             </div>
             <span style={{color:"#fff",fontWeight:"800",fontSize:isMobile?"13px":"15px",letterSpacing:"-0.4px"}}>
-              {isMobile?(bizInfo?.name||"현 회계사 재무포털"):"현 회계사의 고객 전용 재무정보 조회 시스템"}
+              {isMobile?(bizInfo?.name||"고객 전용 재무포털"):"고객 전용 재무정보 조회 시스템"}
             </span>
           </div>
         </div>
@@ -2359,7 +2334,7 @@ function AdminDash({ user, onLogout }) {
       {toast&&<div style={{position:"fixed",top:"20px",right:"20px",zIndex:9999,background:"rgba(255,255,255,0.96)",border:`1px solid ${T.border}`,borderRadius:T.radius,padding:"12px 20px",color:T.text,fontSize:"14px",fontWeight:"500",boxShadow:T.shadowMd,backdropFilter:"blur(20px)"}}>{toast}</div>}
       <header style={{background:T.bgDeep,borderBottom:`1px solid ${T.borderNav}`,padding:"0 24px",height:"52px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
         <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
-          <span style={{color:"#fff",fontWeight:"700",fontSize:"15px",letterSpacing:"-0.4px"}}>현 회계사의 고객 전용 재무정보 조회 시스템</span>
+          <span style={{color:"#fff",fontWeight:"700",fontSize:"15px",letterSpacing:"-0.4px"}}>고객 전용 재무정보 조회 시스템</span>
           <Pill label="관리자"/>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
