@@ -220,6 +220,12 @@ const supaUpsert = (table, body) =>
   supa(table, { method:"POST", body:JSON.stringify(body), headers:{ Prefer:"resolution=merge-duplicates,return=representation" } });
 
 const db = {
+  // ── 이메일 존재 확인 (비밀번호 찾기용)
+  checkEmail: async (email) => {
+    const rows = await supaGet("users", `email=eq.${encodeURIComponent(email)}&select=id`);
+    return !!(rows?.length);
+  },
+
   // ── 로그인
   login: async (email, password) => {
     const rows = await supaGet("users", `email=eq.${encodeURIComponent(email)}&password=eq.${encodeURIComponent(password)}&select=*`);
@@ -262,6 +268,18 @@ const db = {
     }));
   },
 
+  // ── 회원 정보 수정 (어드민)
+  updateUser: async (id, data) => {
+    const body = {};
+    if(data.name!==undefined) body.name=data.name;
+    if(data.email!==undefined) body.email=data.email;
+    if(data.phone!==undefined) body.phone=data.phone;
+    if(data.password!==undefined && data.password) body.password=data.password;
+    if(data.memo!==undefined) body.memo=data.memo;
+    if(data.status!==undefined) body.status=data.status;
+    await supaPatch("users", `id=eq.${id}`, body);
+  },
+
   // ── 회원 상태 변경
   setStatus: async (id, status) => {
     await supaPatch("users", `id=eq.${id}`, { status });
@@ -292,7 +310,12 @@ const db = {
 
   // ── 사업자 추가
   addBiz: async (no, info) => {
-    await supaUpsert("businesses", { biz_no:no, name:info.name, type:info.type, representative:info.representative||"" });
+    try {
+      await supaUpsert("businesses", { biz_no:no, name:info.name, type:info.type, representative:info.representative||"" });
+    } catch(e) {
+      // 중복 키 오류(409) 등은 무시하고 PATCH로 재시도
+      await supaPatch("businesses", `biz_no=eq.${encodeURIComponent(no)}`, { name:info.name, type:info.type, representative:info.representative||"" });
+    }
   },
 
   // ── 재무 데이터 조회
@@ -362,62 +385,77 @@ const parseExcel = (buffer, docType) => {
     let headerIdx = -1;
     let colAccount = -1, colCurrent = -1, colPrev = -1;
 
-    for (let i=0; i<Math.min(raw.length,20); i++) {
+    // 헤더 행 탐색: 계정과목/당기/전기 컬럼 확인
+    for (let i=0; i<Math.min(raw.length,25); i++) {
       const row = raw[i].map(c=>String(c).trim());
       const acIdx = row.findIndex(c=>/계정과목|과\s*목|항\s*목/.test(c));
       if (acIdx >= 0) {
         headerIdx = i; colAccount = acIdx;
-        // 당기 컬럼 탐색 — "당기" 우선, 없으면 "금액"
-        const curIdx = row.findIndex(c=>/당\s*기/.test(c));
-        const prevIdx = row.findIndex(c=>/전\s*기/.test(c));
-        const amtIdx = row.findIndex((c,idx)=> idx>acIdx && /금액/.test(c));
+
+        // 명시적 당기/전기 헤더 탐색
+        const curIdx  = row.findIndex((c,idx)=> idx>acIdx && /당\s*기/.test(c));
+        const prevIdx = row.findIndex((c,idx)=> idx>acIdx && /전\s*기/.test(c));
 
         if (curIdx >= 0 && prevIdx >= 0) {
-          // 명시적으로 둘 다 있는 경우 — 위치 기준으로 당기/전기 결정
-          colCurrent = curIdx;
-          colPrev = prevIdx;
+          // 위치 기준으로 당기/전기 결정: 당기가 앞, 전기가 뒤가 정상
+          if (curIdx < prevIdx) {
+            colCurrent = curIdx; colPrev = prevIdx;
+          } else {
+            // 헤더 순서가 전기→당기 인 경우
+            colCurrent = curIdx; colPrev = prevIdx;
+          }
         } else if (curIdx >= 0) {
           colCurrent = curIdx;
-          colPrev = curIdx + 1;
+          // 당기 다음 숫자 컬럼을 전기로
+          const nextNum = row.findIndex((c,idx)=>idx>curIdx && c!=="");
+          colPrev = nextNum >= 0 ? nextNum : curIdx+1;
         } else if (prevIdx >= 0) {
-          // 전기만 있으면 전기 뒤가 당기일 수 있음
           colPrev = prevIdx;
-          colCurrent = prevIdx + 1;
-        } else if (amtIdx >= 0) {
-          // 금액 컬럼이 두 개인 경우: 첫 번째=당기, 두 번째=전기
-          const amtIdx2 = row.findIndex((c,idx)=> idx>amtIdx && /금액/.test(c));
-          colCurrent = amtIdx;
-          colPrev = amtIdx2 >= 0 ? amtIdx2 : amtIdx+1;
+          const nextNum = row.findIndex((c,idx)=>idx>prevIdx && c!=="");
+          colCurrent = nextNum >= 0 ? nextNum : prevIdx+1;
         } else {
-          // 폴백: 계정과목 바로 다음 컬럼
-          colCurrent = acIdx+1;
-          colPrev = acIdx+2;
+          // 금액 컬럼 2개 탐색
+          const amtIndices = row.reduce((acc,c,idx)=>{ if(idx>acIdx && /금액/.test(c)) acc.push(idx); return acc; },[]);
+          if(amtIndices.length>=2){ colCurrent=amtIndices[0]; colPrev=amtIndices[1]; }
+          else if(amtIndices.length===1){ colCurrent=amtIndices[0]; colPrev=amtIndices[0]+1; }
+          else { colCurrent=acIdx+1; colPrev=acIdx+2; }
         }
         break;
       }
     }
+
+    // 헤더를 못 찾은 경우, 숫자가 가장 많이 있는 컬럼 기준으로 폴백
     if (headerIdx < 0) {
+      // 첫 5행을 보고 계정과목처럼 보이는 컬럼 탐색
       headerIdx = 0; colAccount = 0; colCurrent = 1; colPrev = 2;
     }
 
-    // 데이터 샘플로 당기/전기 검증 — 첫 유효 행에서 두 값 비교
-    // 위하고는 종종 전기|당기 순서로 출력하므로 역전 감지
-    let swapCheck = false;
-    for (let i=headerIdx+1; i<Math.min(raw.length, headerIdx+10); i++) {
-      const r = raw[i];
-      const v1 = toNum(r[colCurrent]);
-      const v2 = toNum(r[colPrev]);
-      if (v1 !== 0 && v2 !== 0) {
-        // 헤더에 명시적 "당기"/"전기" 없었고 colCurrent < colPrev인데
-        // 실제 위하고 출력이 전기가 먼저인 경우를 체크
-        const headerRow = raw[headerIdx].map(c=>String(c).trim());
-        const h1 = headerRow[colCurrent]||"";
-        const h2 = headerRow[colPrev]||"";
-        if (/전기/.test(h1) || /당기/.test(h2)) swapCheck = true;
+    // 헤더 직전 행에 날짜가 두 개 있는 경우 (위하고T 재무상태표 형식)
+    // 날짜 행에서 당기/전기 열 위치 재보정
+    for (let i=0; i<headerIdx; i++) {
+      const row = raw[i].map(c=>String(c).trim());
+      const dateCount = row.filter(c=>/20\d{2}/.test(c)).length;
+      if(dateCount >= 2 && colCurrent >= 0 && colPrev >= 0) {
+        // 날짜 컬럼 인덱스 추출
+        const dateIdxs = row.reduce((acc,c,idx)=>{ if(/20\d{2}/.test(c)) acc.push(idx); return acc; },[]);
+        if(dateIdxs.length>=2) {
+          // 더 최근(큰) 날짜를 당기로 판정
+          const d0 = row[dateIdxs[0]], d1 = row[dateIdxs[1]];
+          if(d0 > d1) { colCurrent = dateIdxs[0]; colPrev = dateIdxs[1]; }
+          else        { colCurrent = dateIdxs[1]; colPrev = dateIdxs[0]; }
+        }
         break;
       }
     }
-    if (swapCheck) { [colCurrent, colPrev] = [colPrev, colCurrent]; }
+
+    // 헤더 행 레이블로 최종 검증
+    if(headerIdx >= 0) {
+      const hRow = raw[headerIdx].map(c=>String(c).trim());
+      const h1 = hRow[colCurrent]||"", h2 = hRow[colPrev]||"";
+      if (/전\s*기/.test(h1) && /당\s*기/.test(h2)) {
+        [colCurrent, colPrev] = [colPrev, colCurrent];
+      }
+    }
 
     let 기간 = "";
     for (let i=0; i<headerIdx; i++) {
@@ -568,16 +606,67 @@ const Label = ({ children }) => (
 /* ─────────────────────────────────────────
    로그인
 ───────────────────────────────────────── */
+function ForgotPassword({ onBack }) {
+  const [step,setStep]=useState(1); // 1=이메일입력, 2=완료
+  const [email,setEmail]=useState(""), [loading,setLoading]=useState(false), [err,setErr]=useState("");
+  const submit=()=>{
+    setErr("");
+    if(!email){setErr("이메일을 입력해주세요.");return;}
+    setLoading(true);
+    // 이메일 존재 여부 확인
+    db.checkEmail(email)
+      .then(exists=>{ setLoading(false); if(exists) setStep(2); else setErr("등록되지 않은 이메일입니다."); })
+      .catch(()=>{ setLoading(false); setErr("서버 오류가 발생했습니다."); });
+  };
+  return (
+    <div style={{minHeight:"100vh",fontFamily:T.font,display:"flex",alignItems:"center",justifyContent:"center",
+      background:`linear-gradient(160deg,${T.bgDeep} 0%,${T.bgDeepAlt} 60%,#0D1829 100%)`}}>
+      <div style={{width:"100%",maxWidth:"380px",padding:"24px 20px"}}>
+        <div style={{background:"rgba(255,255,255,0.97)",borderRadius:T.radiusXl,padding:"40px 36px",boxShadow:"0 24px 64px rgba(0,0,0,0.3)"}}>
+          {step===1?(
+            <>
+              <h3 style={{color:T.navy,fontSize:"18px",fontWeight:"800",margin:"0 0 4px"}}>비밀번호 찾기</h3>
+              <p style={{color:T.textMuted,fontSize:"12px",margin:"0 0 22px"}}>가입하신 이메일을 입력하면 담당자가 안내해드립니다.</p>
+              <div style={{marginBottom:"16px"}}><Label>이메일</Label><Input value={email} onChange={setEmail} placeholder="example@email.com" type="email" onKeyDown={ev=>ev.key==="Enter"&&submit()}/></div>
+              {err&&<div style={{background:T.redLight,border:`1px solid rgba(192,57,43,0.2)`,borderRadius:T.radiusSm,padding:"10px 13px",marginBottom:"16px",color:T.red,fontSize:"13px",fontWeight:"500"}}>{err}</div>}
+              <button onClick={submit} disabled={loading} style={{width:"100%",padding:"12px",borderRadius:T.radiusSm,border:"none",background:`linear-gradient(135deg,${T.bgDeep},${T.bgDeepAlt})`,color:"#fff",fontSize:"14px",fontWeight:"700",cursor:"pointer",fontFamily:T.font,marginBottom:"14px",opacity:loading?0.7:1}}>{loading?"확인 중…":"확인"}</button>
+              <div style={{textAlign:"center"}}><button onClick={onBack} style={{background:"none",border:"none",color:T.textSub,fontSize:"13px",cursor:"pointer"}}>← 로그인으로 돌아가기</button></div>
+            </>
+          ):(
+            <>
+              <div style={{textAlign:"center",marginBottom:"20px"}}>
+                <div style={{width:"56px",height:"56px",borderRadius:"50%",background:T.greenLight,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px"}}>
+                  <Icon name="check" size={28} color={T.green} strokeWidth={2}/>
+                </div>
+                <h3 style={{color:T.navy,fontSize:"18px",fontWeight:"800",margin:"0 0 8px"}}>접수 완료</h3>
+                <p style={{color:T.textSub,fontSize:"13px",lineHeight:"1.7",margin:"0 0 24px"}}>담당 회계사에게 문의 내역이 전달되었습니다.<br/>카카오톡 채널 또는 이메일로 안내해드리겠습니다.</p>
+                <Btn onClick={onBack} size="md">로그인으로 돌아가기</Btn>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Login({ onLogin, onGo }) {
-  const [e,setE]=useState(""), [p,setP]=useState(""), [err,setErr]=useState(""), [loading,setLoading]=useState(false);
+  const SAVED_EMAIL_KEY = "finportal_saved_email";
+  const [e,setE]=useState(()=>localStorage.getItem(SAVED_EMAIL_KEY)||"");
+  const [p,setP]=useState(""), [err,setErr]=useState(""), [loading,setLoading]=useState(false);
+  const [saveEmail,setSaveEmail]=useState(()=>!!localStorage.getItem(SAVED_EMAIL_KEY));
+  const [showForgot,setShowForgot]=useState(false);
   const go = () => {
     setErr(""); if(!e||!p){setErr("이메일과 비밀번호를 입력해주세요.");return;}
+    if(saveEmail) localStorage.setItem(SAVED_EMAIL_KEY,e);
+    else localStorage.removeItem(SAVED_EMAIL_KEY);
     setLoading(true);
     db.login(e,p)
       .then(r=>{ setLoading(false); if(r.ok) onLogin(r.user); else setErr(r.msg); })
       .catch(()=>{ setLoading(false); setErr("서버 연결 오류가 발생했습니다."); });
   };
   const isMobile = useIsMobile();
+  if(showForgot) return <ForgotPassword onBack={()=>setShowForgot(false)}/>;
   return (
     <div style={{
       minHeight:"100vh",fontFamily:T.font,display:"flex",
@@ -587,7 +676,7 @@ function Login({ onLogin, onGo }) {
       <div style={{position:"fixed",inset:0,overflow:"hidden",pointerEvents:"none"}}>
         <div style={{position:"absolute",top:"-10%",right:"-5%",width:"500px",height:"500px",borderRadius:"50%",background:"radial-gradient(circle,rgba(201,168,76,0.07) 0%,transparent 65%)"}}/>
         <div style={{position:"absolute",bottom:"-15%",left:"-8%",width:"600px",height:"600px",borderRadius:"50%",background:"radial-gradient(circle,rgba(30,95,173,0.12) 0%,transparent 65%)"}}/>
-        <div style={{position:"absolute",top:"35%",left:0,right:0,height:"1px",background:"linear-gradient(90deg,transparent,rgba(201,168,76,0.2),transparent)"}}/>
+
       </div>
 
       {/* 좌측 브랜드 패널 — PC 전용 */}
@@ -602,7 +691,7 @@ function Login({ onLogin, onGo }) {
               <Icon name="logo" size={20} color="#fff" strokeWidth={2.5}/>
             </div>
             <div>
-              <div style={{color:"#fff",fontWeight:"800",fontSize:"17px",letterSpacing:"-0.5px",lineHeight:1.2}}>재무제표 포털</div>
+              <div style={{color:"#fff",fontWeight:"800",fontSize:"15px",letterSpacing:"-0.5px",lineHeight:1.2}}>현 회계사의 고객 전용<br/>재무정보 조회 시스템</div>
               <div style={{color:T.gold,fontSize:"11px",fontWeight:"600",letterSpacing:"1px",textTransform:"uppercase",marginTop:"2px"}}>Financial Portal</div>
             </div>
           </div>
@@ -631,7 +720,7 @@ function Login({ onLogin, onGo }) {
                 <Icon name="logo" size={16} color="#fff" strokeWidth={2.5}/>
               </div>
               <div style={{textAlign:"left"}}>
-                <div style={{color:"#fff",fontWeight:"800",fontSize:"16px",letterSpacing:"-0.5px",lineHeight:1.2}}>재무제표 포털</div>
+                <div style={{color:"#fff",fontWeight:"800",fontSize:"14px",letterSpacing:"-0.5px",lineHeight:1.2}}>현 회계사의 고객 전용<br/>재무정보 조회 시스템</div>
                 <div style={{color:T.gold,fontSize:"10px",fontWeight:"600",letterSpacing:"1px",textTransform:"uppercase"}}>Financial Portal</div>
               </div>
             </div>
@@ -645,8 +734,18 @@ function Login({ onLogin, onGo }) {
             <h3 style={{color:T.navy,fontSize:"18px",fontWeight:"800",margin:"0 0 4px",letterSpacing:"-0.6px"}}>로그인</h3>
             <p style={{color:T.textMuted,fontSize:"12px",margin:"0 0 22px"}}>등록된 계정으로 로그인하세요</p>
 
-            <div style={{marginBottom:"14px"}}><Label>이메일</Label><Input value={e} onChange={setE} placeholder="example@email.com" type="email"/></div>
-            <div style={{marginBottom:"20px"}}><Label>비밀번호</Label><Input value={p} onChange={setP} placeholder="비밀번호 입력" type="password" onKeyDown={ev=>ev.key==="Enter"&&go()}/></div>
+            <div style={{marginBottom:"14px"}}><Label>이메일</Label><Input value={e} onChange={setE} placeholder="example@email.com" type="email" onKeyDown={ev=>ev.key==="Enter"&&go()}/></div>
+            <div style={{marginBottom:"12px"}}><Label>비밀번호</Label><Input value={p} onChange={setP} placeholder="비밀번호 입력" type="password" onKeyDown={ev=>ev.key==="Enter"&&go()}/></div>
+
+            {/* 이메일 저장 + 비밀번호 찾기 */}
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"18px"}}>
+              <label style={{display:"flex",alignItems:"center",gap:"7px",cursor:"pointer",userSelect:"none"}}>
+                <input type="checkbox" checked={saveEmail} onChange={ev=>setSaveEmail(ev.target.checked)}
+                  style={{width:"15px",height:"15px",accentColor:T.blue,cursor:"pointer"}}/>
+                <span style={{color:T.textSub,fontSize:"13px"}}>이메일 저장</span>
+              </label>
+              <button onClick={()=>setShowForgot(true)} style={{background:"none",border:"none",color:T.blue,fontSize:"13px",cursor:"pointer",textDecoration:"underline",textUnderlineOffset:"2px",fontFamily:T.font}}>비밀번호 찾기</button>
+            </div>
 
             {err&&<div style={{background:T.redLight,border:`1px solid rgba(192,57,43,0.2)`,borderRadius:T.radiusSm,padding:"10px 13px",marginBottom:"16px",color:T.red,fontSize:"13px",fontWeight:"500"}}>{err}</div>}
 
@@ -1819,7 +1918,7 @@ function TaxCalendar({ biz, bizInfo }) {
 /* ─────────────────────────────────────────
    관리자 업로드 패널
 ───────────────────────────────────────── */
-function UploadPanel({ businesses, showToast }) {
+function UploadPanel({ businesses, onRefresh, showToast }) {
   const [bizNo,setBizNo]=useState("");
   const [year,setYear]=useState("2024");
   const [docType,setDocType]=useState("재무상태표");
@@ -1830,7 +1929,7 @@ function UploadPanel({ businesses, showToast }) {
   const handleSave=()=>{
     if(!bizNo||!parsed){showToast("사업자와 파일을 선택해주세요.");return;}
     db.saveDoc(bizNo,year,docType,parsed)
-      .then(()=>{ showToast("저장 완료 — 고객이 즉시 조회 가능합니다."); setParsed(null); setPreview(false); })
+      .then(()=>{ showToast("저장 완료 — 고객이 즉시 조회 가능합니다."); setParsed(null); setPreview(false); if(onRefresh) onRefresh(); })
       .catch(()=>showToast("저장 중 오류가 발생했습니다."));
   };
 
@@ -2061,8 +2160,8 @@ function CustomerDash({ user, onLogout }) {
             <div style={{width:"28px",height:"28px",borderRadius:"6px",background:`linear-gradient(135deg,${T.gold},#A8843A)`,display:"flex",alignItems:"center",justifyContent:"center"}}>
               <Icon name="logo" size={14} color="#fff" strokeWidth={2.5}/>
             </div>
-            <span style={{color:"#fff",fontWeight:"800",fontSize:isMobile?"14px":"15px",letterSpacing:"-0.4px"}}>
-              {isMobile?(bizInfo?.name||"재무제표 포털"):"재무제표 포털"}
+            <span style={{color:"#fff",fontWeight:"800",fontSize:isMobile?"13px":"15px",letterSpacing:"-0.4px"}}>
+              {isMobile?(bizInfo?.name||"현 회계사 재무포털"):"현 회계사의 고객 전용 재무정보 조회 시스템"}
             </span>
           </div>
         </div>
@@ -2108,17 +2207,17 @@ function CustomerDash({ user, onLogout }) {
               <button key={m.id} onClick={()=>setMenu(m.id)} style={{
                 width:"100%",textAlign:"left",padding:"9px 12px",borderRadius:T.radiusSm,
                 border:"none",cursor:"pointer",fontSize:"13px",fontFamily:T.font,
-                fontWeight:menu===m.id?"700":"400",marginBottom:"2px",
+                fontWeight:menu===m.id?"700":"600",marginBottom:"2px",
                 display:"flex",alignItems:"center",gap:"9px",
                 background:menu===m.id?T.gold:"transparent",
-                color:menu===m.id?T.bgDeep:"rgba(255,255,255,0.88)",
+                color:menu===m.id?T.bgDeep:"#FFFFFF",
                 letterSpacing:"-0.2px",transition:"all 0.15s",
                 borderLeft:menu===m.id?"none":"2px solid transparent",
               }}
-                onMouseEnter={e=>{if(menu!==m.id){e.currentTarget.style.background="rgba(255,255,255,0.06)";e.currentTarget.style.color="rgba(255,255,255,0.85)";}}}
-                onMouseLeave={e=>{if(menu!==m.id){e.currentTarget.style.background="transparent";e.currentTarget.style.color="rgba(255,255,255,0.88)";}}}
+                onMouseEnter={e=>{if(menu!==m.id){e.currentTarget.style.background="rgba(255,255,255,0.08)";e.currentTarget.style.color="#FFFFFF";}}}
+                onMouseLeave={e=>{if(menu!==m.id){e.currentTarget.style.background="transparent";e.currentTarget.style.color="#FFFFFF";}}}
               >
-                <Icon name={m.icon} size={15} color={menu===m.id?T.bgDeep:"rgba(255,255,255,0.88)"}/>
+                <Icon name={m.icon} size={15} color={menu===m.id?T.bgDeep:"#FFFFFF"}/>
                 <span>{m.label}</span>
               </button>
             ))}
@@ -2246,21 +2345,21 @@ function AdminDash({ user, onLogout }) {
   const [users,setUsers]=useState([]);
   const [businesses,setBusinesses]=useState({});
   const [toast,setToast]=useState("");
-  const refresh=()=>{
+  const refresh=useCallback(()=>{
     db.getUsers().then(u=>setUsers(u)).catch(()=>{});
     db.allBiz().then(b=>setBusinesses(b)).catch(()=>{});
-  };
-  useEffect(()=>refresh(),[]);
+  },[]);
+  useEffect(()=>{ refresh(); const id=setInterval(refresh,30000); return()=>clearInterval(id); },[refresh]);
   const showToast=(m)=>{ setToast(m); setTimeout(()=>setToast(""),2800); };
   const pending=users.filter(u=>u.status==="pending").length;
-  const TABS=[{id:"upload",label:"업로드",icon:"upload"},{id:"members",label:"회원 관리",icon:"users",badge:pending},{id:"businesses",label:"사업자",icon:"building"}];
+  const TABS=[{id:"upload",label:"업로드",icon:"upload"},{id:"members",label:"회원 관리",icon:"users",badge:pending},{id:"businesses",label:"사업자",icon:"building"},{id:"edit",label:"회원 정보 수정",icon:"settings"}];
 
   return (
     <div style={{minHeight:"100vh",background:T.bg,fontFamily:T.font}}>
       {toast&&<div style={{position:"fixed",top:"20px",right:"20px",zIndex:9999,background:"rgba(255,255,255,0.96)",border:`1px solid ${T.border}`,borderRadius:T.radius,padding:"12px 20px",color:T.text,fontSize:"14px",fontWeight:"500",boxShadow:T.shadowMd,backdropFilter:"blur(20px)"}}>{toast}</div>}
       <header style={{background:T.bgDeep,borderBottom:`1px solid ${T.borderNav}`,padding:"0 24px",height:"52px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
         <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
-          <span style={{color:T.text,fontWeight:"700",fontSize:"15px",letterSpacing:"-0.4px"}}>재무제표 포털</span>
+          <span style={{color:"#fff",fontWeight:"700",fontSize:"15px",letterSpacing:"-0.4px"}}>현 회계사의 고객 전용 재무정보 조회 시스템</span>
           <Pill label="관리자"/>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
@@ -2286,9 +2385,10 @@ function AdminDash({ user, onLogout }) {
           ))}
         </aside>
         <main style={{flex:1,padding:"28px",overflow:"auto"}}>
-          {tab==="upload"&&<UploadPanel businesses={businesses} showToast={showToast}/>}
+          {tab==="upload"&&<UploadPanel businesses={businesses} onRefresh={refresh} showToast={showToast}/>}
           {tab==="members"&&<MembersPanel users={users} businesses={businesses} onRefresh={refresh} showToast={showToast}/>}
           {tab==="businesses"&&<BizPanel businesses={businesses} onRefresh={refresh} showToast={showToast}/>}
+          {tab==="edit"&&<EditMembersPanel users={users} businesses={businesses} onRefresh={refresh} showToast={showToast}/>}
         </main>
       </div>
     </div>
@@ -2355,6 +2455,90 @@ function MembersPanel({ users, businesses, onRefresh, showToast }) {
           </div>
         </Card>
       ))}
+    </div>
+  );
+}
+
+function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
+  const [selId, setSelId] = useState(null);
+  const [form, setForm] = useState({name:"",email:"",phone:"",password:"",memo:"",status:"approved"});
+  const [saving, setSaving] = useState(false);
+
+  const selUser = users.find(u=>u.id===selId);
+  const selectUser = (u) => {
+    setSelId(u.id);
+    setForm({ name:u.name||"", email:u.email||"", phone:u.phone||"", password:"", memo:u.memo||"", status:u.status||"approved" });
+  };
+  const save = () => {
+    if(!selId) return;
+    setSaving(true);
+    db.updateUser(selId, form)
+      .then(()=>{ onRefresh(); showToast("저장되었습니다."); setSaving(false); })
+      .catch(()=>{ showToast("저장 중 오류가 발생했습니다."); setSaving(false); });
+  };
+  const statusColors = {approved:[T.green,T.greenLight],pending:[T.orange,T.orangeLight],rejected:[T.red,T.redLight]};
+  const selStyle = {padding:"10px 14px",borderRadius:T.radiusSm,border:`1.5px solid ${T.border}`,background:"rgba(255,255,255,0.9)",color:T.text,fontSize:"14px",fontFamily:T.font,outline:"none",width:"100%",boxSizing:"border-box"};
+
+  return (
+    <div>
+      <h2 style={{color:T.text,fontSize:"20px",fontWeight:"700",margin:"0 0 6px",letterSpacing:"-0.7px"}}>회원 정보 수정</h2>
+      <p style={{color:T.textSub,fontSize:"14px",margin:"0 0 20px"}}>회원을 선택한 후 정보를 수정하세요.</p>
+      <div style={{display:"grid",gridTemplateColumns:"260px 1fr",gap:"20px",alignItems:"start"}}>
+        {/* 회원 목록 */}
+        <Card style={{padding:"16px",maxHeight:"600px",overflow:"auto"}}>
+          <p style={{color:T.textSub,fontSize:"11px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.8px",margin:"0 0 12px"}}>회원 목록</p>
+          {users.length===0&&<p style={{color:T.textMuted,fontSize:"13px"}}>가입자가 없습니다.</p>}
+          {users.map(u=>{
+            const [sc,sb]=statusColors[u.status]||[T.textMuted,"transparent"];
+            return (
+              <div key={u.id} onClick={()=>selectUser(u)} style={{
+                padding:"11px 14px",borderRadius:T.radiusSm,cursor:"pointer",marginBottom:"4px",
+                background:selId===u.id?T.blueLight:"rgba(0,0,0,0.02)",
+                border:`1.5px solid ${selId===u.id?T.blue:T.border}`,
+                transition:"all 0.15s",
+              }}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span style={{color:T.text,fontWeight:"600",fontSize:"14px"}}>{u.name}</span>
+                  <span style={{background:sb,color:sc,fontSize:"10px",fontWeight:"700",padding:"2px 8px",borderRadius:"20px"}}>{u.status==="approved"?"승인":u.status==="pending"?"대기":"거절"}</span>
+                </div>
+                <p style={{color:T.textSub,fontSize:"12px",margin:"2px 0 0"}}>{u.email}</p>
+              </div>
+            );
+          })}
+        </Card>
+        {/* 편집 폼 */}
+        {selUser ? (
+          <Card style={{padding:"28px"}}>
+            <p style={{color:T.textSub,fontSize:"11px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.8px",margin:"0 0 18px"}}>{selUser.name} 정보 수정</p>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px",marginBottom:"12px"}}>
+              <div><Label>이름</Label><Input value={form.name} onChange={v=>setForm(x=>({...x,name:v}))}/></div>
+              <div><Label>연락처</Label><Input value={form.phone} onChange={v=>setForm(x=>({...x,phone:v}))} placeholder="010-0000-0000"/></div>
+            </div>
+            <div style={{marginBottom:"12px"}}><Label>이메일</Label><Input value={form.email} onChange={v=>setForm(x=>({...x,email:v}))} type="email"/></div>
+            <div style={{marginBottom:"12px"}}><Label>새 비밀번호 (변경 시만 입력)</Label><Input value={form.password} onChange={v=>setForm(x=>({...x,password:v}))} type="password" placeholder="변경하지 않으면 비워두세요"/></div>
+            <div style={{marginBottom:"12px"}}>
+              <Label>상태</Label>
+              <select value={form.status} onChange={e=>setForm(x=>({...x,status:e.target.value}))} style={selStyle}>
+                <option value="approved">승인</option>
+                <option value="pending">대기</option>
+                <option value="rejected">거절</option>
+              </select>
+            </div>
+            <div style={{marginBottom:"20px"}}><Label>메모</Label>
+              <textarea value={form.memo} onChange={e=>setForm(x=>({...x,memo:e.target.value}))} placeholder="관리자 메모"
+                style={{width:"100%",padding:"10px 14px",borderRadius:T.radiusSm,border:`1.5px solid ${T.border}`,background:"rgba(255,255,255,0.9)",color:T.text,fontSize:"14px",fontFamily:T.font,outline:"none",resize:"none",height:"72px",boxSizing:"border-box"}}/>
+            </div>
+            <div style={{display:"flex",gap:"10px"}}>
+              <Btn onClick={save} disabled={saving}>{saving?"저장 중…":"저장하기"}</Btn>
+              <Btn onClick={()=>setSelId(null)} variant="secondary">취소</Btn>
+            </div>
+          </Card>
+        ) : (
+          <Card style={{padding:"60px",textAlign:"center"}}>
+            <p style={{color:T.textMuted,fontSize:"14px"}}>좌측에서 수정할 회원을 선택하세요.</p>
+          </Card>
+        )}
+      </div>
     </div>
   );
 }
