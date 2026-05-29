@@ -255,10 +255,28 @@ const db = {
     const userId = newUser?.[0]?.id;
     if (userId && data.businesses?.length) {
       for (const biz_no of data.businesses) {
-        await supaPost("user_businesses", { user_id:userId, biz_no }).catch(()=>{});
+        const trimmed = biz_no.trim();
+        if (!trimmed) continue;
+        // user_businesses 테이블에 연결
+        await supaPost("user_businesses", { user_id:userId, biz_no:trimmed }).catch(()=>{});
+        // businesses 테이블에도 등록 (상호명 미입력 시 사업자번호를 임시 상호로)
+        const bizName = (data.bizNames && data.bizNames[trimmed]) || trimmed;
+        await supaUpsert("businesses", { biz_no:trimmed, name:bizName, type:"개인", representative:data.name||"" }).catch(()=>{});
       }
     }
     return { ok:true };
+  },
+
+  // ── 전체 사업자번호 목록 (user_businesses 포함 — 업로드 패널용)
+  getAllBizNos: async () => {
+    // businesses 테이블 + user_businesses에 있지만 businesses에 없는 것도 포함
+    const bizRows = await supaGet("businesses", "select=*&order=name");
+    const ubRows  = await supaGet("user_businesses", "select=biz_no");
+    const bizMap = {};
+    (bizRows||[]).forEach(r=>{ bizMap[r.biz_no]={ name:r.name, type:r.type, representative:r.representative }; });
+    // user_businesses에만 있는 사업자번호 추가 (상호 미등록 상태)
+    (ubRows||[]).forEach(r=>{ if(!bizMap[r.biz_no]) bizMap[r.biz_no]={ name:r.biz_no, type:"-", representative:"" }; });
+    return bizMap;
   },
 
   // ── 사용자 목록 (관리자용)
@@ -366,130 +384,146 @@ const FK = (n) => {
 
 /* ─────────────────────────────────────────
    위하고 Excel 파서
-   지원 형식:
-   - 재무상태표: 계정과목 / 당기 / 전기 컬럼
-   - 손익계산서: 계정과목 / 당기 / 전기 컬럼
-   - 부가세신고: 기수/매출세액/매입세액/납부세액 등
-   - 법인세신고: 과세표준/산출세액/납부세액 등
+   ┌ 재무상태표/손익계산서: 5컬럼 구조
+   │  col0=과목  col1=당기세부  col2=당기순액  col3=전기세부  col4=전기순액
+   │  → col2(당기 순액/합계), col4(전기 순액/합계) 사용
+   ├ 부가세신고: 기수/매출세액/매입세액/납부세액
+   └ 법인세신고: 과세표준/산출세액/납부세액
 ───────────────────────────────────────── */
 const parseExcel = (buffer, docType) => {
   const wb = XLSX.read(buffer, { type: "array" });
   const ws = wb.Sheets[wb.SheetNames[0]];
-  const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:"", raw:false });
+  // raw:true 로 숫자를 숫자형으로 받음
+  const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:"", raw:true });
 
-  // 숫자 정제 (쉼표, 공백 제거 → 숫자)
+  // 숫자 정제: 숫자형이면 그대로, 문자면 쉼표·괄호 처리
   const toNum = (v) => {
     if(v===null||v===undefined||v==="") return 0;
-    const s = String(v).replace(/,/g,"").replace(/\s/g,"").replace(/원/g,"").replace(/\((.+)\)/,"−$1");
-    const n = parseFloat(s);
-    return isNaN(n)?0:n;
+    if(typeof v === "number") return v;
+    const s = String(v).replace(/,/g,"").replace(/\s/g,"").replace(/원/g,"");
+    // (음수) 표기 처리
+    const neg = s.match(/^\((.+)\)$/);
+    const n = parseFloat(neg ? neg[1] : s);
+    return isNaN(n) ? 0 : (neg ? -n : n);
   };
 
   if (docType === "재무상태표" || docType === "손익계산서") {
-    let headerIdx = -1;
-    let colAccount = -1, colCurrent = -1, colPrev = -1;
+    /*
+     * 위하고T 5컬럼 구조:
+     *   [0] 과목
+     *   [1] 당기 세부금액(취득액 등) ← 무시
+     *   [2] 당기 순액/합계           ← colCurrent
+     *   [3] 전기 세부금액(취득액 등) ← 무시
+     *   [4] 전기 순액/합계           ← colPrev
+     *
+     * 일반 3컬럼 구조(과목/당기/전기)도 지원.
+     */
+    let headerRow0 = -1; // 당기·전기 기간 텍스트가 있는 행
+    let headerRow1 = -1; // "금액" 서브헤더 행 (있는 경우)
+    let dataStart  = -1;
+    let colAccount = 0, colCurrent = 2, colPrev = 4; // 기본: 5컬럼
 
-    // 헤더 행 탐색: 계정과목/당기/전기 컬럼 확인
-    for (let i=0; i<Math.min(raw.length,25); i++) {
-      const row = raw[i].map(c=>String(c).trim());
-      const acIdx = row.findIndex(c=>/계정과목|과\s*목|항\s*목/.test(c));
-      if (acIdx >= 0) {
-        headerIdx = i; colAccount = acIdx;
-
-        // 명시적 당기/전기 헤더 탐색
-        const curIdx  = row.findIndex((c,idx)=> idx>acIdx && /당\s*기/.test(c));
-        const prevIdx = row.findIndex((c,idx)=> idx>acIdx && /전\s*기/.test(c));
-
-        if (curIdx >= 0 && prevIdx >= 0) {
-          // 위치 기준으로 당기/전기 결정: 당기가 앞, 전기가 뒤가 정상
-          if (curIdx < prevIdx) {
-            colCurrent = curIdx; colPrev = prevIdx;
-          } else {
-            // 헤더 순서가 전기→당기 인 경우
-            colCurrent = curIdx; colPrev = prevIdx;
-          }
-        } else if (curIdx >= 0) {
-          colCurrent = curIdx;
-          // 당기 다음 숫자 컬럼을 전기로
-          const nextNum = row.findIndex((c,idx)=>idx>curIdx && c!=="");
-          colPrev = nextNum >= 0 ? nextNum : curIdx+1;
-        } else if (prevIdx >= 0) {
-          colPrev = prevIdx;
-          const nextNum = row.findIndex((c,idx)=>idx>prevIdx && c!=="");
-          colCurrent = nextNum >= 0 ? nextNum : prevIdx+1;
-        } else {
-          // 금액 컬럼 2개 탐색
-          const amtIndices = row.reduce((acc,c,idx)=>{ if(idx>acIdx && /금액/.test(c)) acc.push(idx); return acc; },[]);
-          if(amtIndices.length>=2){ colCurrent=amtIndices[0]; colPrev=amtIndices[1]; }
-          else if(amtIndices.length===1){ colCurrent=amtIndices[0]; colPrev=amtIndices[0]+1; }
-          else { colCurrent=acIdx+1; colPrev=acIdx+2; }
-        }
+    // ── 헤더 행 탐색
+    for (let i = 0; i < Math.min(raw.length, 20); i++) {
+      const row = raw[i].map(c => String(c).trim());
+      // "과목" 또는 "계정과목" 헤더 행
+      if (row.some(c => /^(과\s*목|계정과목|항\s*목)$/.test(c))) {
+        headerRow1 = i;
+        dataStart  = i + 1;
+        colAccount = row.findIndex(c => /^(과\s*목|계정과목|항\s*목)$/.test(c));
         break;
       }
+      // 당기/전기 기간 텍스트 행
+      if (row.some(c => /당.*기|전.*기/.test(c))) {
+        headerRow0 = i;
+      }
     }
 
-    // 헤더를 못 찾은 경우, 숫자가 가장 많이 있는 컬럼 기준으로 폴백
-    if (headerIdx < 0) {
-      // 첫 5행을 보고 계정과목처럼 보이는 컬럼 탐색
-      headerIdx = 0; colAccount = 0; colCurrent = 1; colPrev = 2;
+    // 폴백: 첫 행을 헤더로
+    if (dataStart < 0) { dataStart = 1; colAccount = 0; }
+
+    // ── 실제 컬럼 수로 당기/전기 위치 결정
+    // 데이터 첫 유효 행을 찾아 컬럼 수 확인
+    let sampleRow = null;
+    for (let i = dataStart; i < Math.min(raw.length, dataStart + 10); i++) {
+      if (raw[i] && raw[i].some(v => v !== "" && v !== null)) {
+        sampleRow = raw[i]; break;
+      }
+    }
+    const totalCols = sampleRow ? sampleRow.length : 3;
+
+    if (totalCols >= 5) {
+      // 5컬럼: [0]과목 [1]당기세부 [2]당기순액 [3]전기세부 [4]전기순액
+      colAccount = 0; colCurrent = 2; colPrev = 4;
+    } else if (totalCols >= 3) {
+      // 3컬럼: [0]과목 [1]당기 [2]전기
+      colAccount = 0; colCurrent = 1; colPrev = 2;
     }
 
-    // 헤더 직전 행에 날짜가 두 개 있는 경우 (위하고T 재무상태표 형식)
-    // 날짜 행에서 당기/전기 열 위치 재보정
-    for (let i=0; i<headerIdx; i++) {
-      const row = raw[i].map(c=>String(c).trim());
-      const dateCount = row.filter(c=>/20\d{2}/.test(c)).length;
-      if(dateCount >= 2 && colCurrent >= 0 && colPrev >= 0) {
-        // 날짜 컬럼 인덱스 추출
-        const dateIdxs = row.reduce((acc,c,idx)=>{ if(/20\d{2}/.test(c)) acc.push(idx); return acc; },[]);
-        if(dateIdxs.length>=2) {
-          // 더 최근(큰) 날짜를 당기로 판정
-          const d0 = row[dateIdxs[0]], d1 = row[dateIdxs[1]];
-          if(d0 > d1) { colCurrent = dateIdxs[0]; colPrev = dateIdxs[1]; }
-          else        { colCurrent = dateIdxs[1]; colPrev = dateIdxs[0]; }
+    // ── 헤더 텍스트에서 당기/전기 컬럼 위치 재확인 (혹시 컬럼 순서가 다를 때)
+    if (headerRow0 >= 0) {
+      const hRow = raw[headerRow0].map(c => String(c).trim());
+      const curIdxs  = hRow.reduce((a,c,i)=>{ if(/당.*기/.test(c)) a.push(i); return a; }, []);
+      const prevIdxs = hRow.reduce((a,c,i)=>{ if(/전.*기/.test(c)) a.push(i); return a; }, []);
+      if (curIdxs.length && prevIdxs.length) {
+        // 당기 그룹의 마지막 컬럼 = 순액, 전기 그룹의 마지막 컬럼 = 순액
+        // (헤더가 병합셀이라 보통 첫 번째 인덱스만 잡힘 → 그 다음 그룹 시작 직전이 순액)
+        const curBase  = curIdxs[0];
+        const prevBase = prevIdxs[0];
+        if (curBase < prevBase) {
+          colCurrent = prevBase - 1;  // 전기 시작 직전 = 당기 순액
+          colPrev    = prevBase + (prevBase - curBase) - 1; // 전기 순액
+          // 안전장치: 범위 초과 시 기본값 유지
+          if (colCurrent <= colAccount) { colCurrent = curBase + 1; }
+          if (colPrev    >= totalCols)  { colPrev = totalCols - 1; }
         }
-        break;
       }
     }
 
-    // 헤더 행 레이블로 최종 검증
-    if(headerIdx >= 0) {
-      const hRow = raw[headerIdx].map(c=>String(c).trim());
-      const h1 = hRow[colCurrent]||"", h2 = hRow[colPrev]||"";
-      if (/전\s*기/.test(h1) && /당\s*기/.test(h2)) {
-        [colCurrent, colPrev] = [colPrev, colCurrent];
-      }
-    }
-
+    // ── 기간 텍스트 추출
     let 기간 = "";
-    for (let i=0; i<headerIdx; i++) {
-      const line = raw[i].join(" ");
+    for (let i = 0; i <= Math.max(headerRow0, 0); i++) {
+      const line = raw[i].map(c=>String(c)).join(" ");
       if (/20\d{2}/.test(line)) { 기간 = line.replace(/\s+/g," ").trim(); break; }
     }
 
+    // ── 행 분류 키워드
+    const totalKw    = /총계|합\s*계|순이익|당기순|자본총|부채총|자산총|부채및자본총계/;
+    const subtotalKw = /총이익|영업이익|차감전|소\s*계|매출총이익/;
+    const skipKw     = /^(자산|부채|자본)$|감가상각누계액|대손충당금|^\(당기순이익\)/;
+    // 감가상각누계액 행은 순액(col2/col4)에 이미 반영되어 있으므로 스킵
+
     const rows = [];
-    const totalKeywords = /총계|합\s*계|순이익|당기순|자본총|부채총|자산총/;
-    const subtotalKeywords = /총이익|영업이익|차감전|소\s*계/;
-    const headerKeywords = /^(유동|비유동|판매비|영업외|자 *본|부 *채|자 *산|매출액|매출원가)/;
 
-    for (let i=headerIdx+1; i<raw.length; i++) {
+    for (let i = dataStart; i < raw.length; i++) {
       const row = raw[i];
-      const acRaw = String(row[colAccount]||"").trim();
-      if (!acRaw || acRaw==="0") continue;
+      if (!row || row.every(v => v === "" || v === null)) continue;
 
-      const cur = toNum(row[colCurrent]);
+      const acRaw = String(row[colAccount] || "").trim();
+      if (!acRaw || acRaw === "0") continue;
+      // 스킵 대상 행
+      if (skipKw.test(acRaw)) continue;
+      // 순수 날짜/메모 행 스킵 (당기: … 원 형태)
+      if (/^(당기|전기)\s*:/.test(acRaw)) continue;
+
+      // 당기·전기 순액 읽기
+      const cur  = toNum(row[colCurrent]);
       const prev = toNum(row[colPrev]);
-      if (cur===0 && prev===0 && acRaw.length < 2) continue;
 
-      const leadSpace = (String(row[colAccount]||"").match(/^(\s+)/)||["",""])[1].length;
-      const level = leadSpace > 4 ? 2 : leadSpace > 0 ? 1 : 0;
+      // 둘 다 0이고 짧은 텍스트면 섹션 구분자일 수 있어 스킵
+      if (cur === 0 && prev === 0 && acRaw.length <= 2) continue;
+
+      // 들여쓰기로 레벨 판정
+      const rawAc = String(row[colAccount] || "");
+      const leadSpace = (rawAc.match(/^(\s+)/) || ["",""])[1].length;
+      const level = leadSpace > 8 ? 2 : leadSpace > 2 ? 1 : 0;
 
       let type = "item";
-      if (totalKeywords.test(acRaw)) type = "total";
-      else if (subtotalKeywords.test(acRaw)) type = "subtotal";
-      else if (level===0 && headerKeywords.test(acRaw)) type = "header";
+      if (totalKw.test(acRaw))    type = "total";
+      else if (subtotalKw.test(acRaw)) type = "subtotal";
+      else if (level === 0)        type = "header";
 
-      rows.push({ 계정과목: acRaw, 당기:cur, 전기:prev, level, type });
+      rows.push({ 계정과목: acRaw, 당기: cur, 전기: prev, level, type });
     }
 
     return { 기간, rows };
@@ -766,7 +800,9 @@ function Register({ onGo }) {
     const vb=bizs.filter(b=>b.no.trim());
     if(!vb.length){setErr("사업자번호를 1개 이상 입력해주세요.");return;}
     setL(true);
-    db.register({name:f.name,email:f.email,password:f.pw,phone:f.phone,memo:f.memo,businesses:vb.map(b=>b.no.trim())})
+    const bizNames = {};
+    vb.forEach(b=>{ if(b.name.trim()) bizNames[b.no.trim()]=b.name.trim(); });
+    db.register({name:f.name,email:f.email,password:f.pw,phone:f.phone,memo:f.memo,businesses:vb.map(b=>b.no.trim()),bizNames})
       .then(r=>{ setL(false); if(r.ok) setOk(true); else setErr(r.msg); })
       .catch(()=>{ setL(false); setErr("서버 연결 오류가 발생했습니다."); });
   };
@@ -2322,7 +2358,7 @@ function AdminDash({ user, onLogout }) {
   const [toast,setToast]=useState("");
   const refresh=useCallback(()=>{
     db.getUsers().then(u=>setUsers(u)).catch(()=>{});
-    db.allBiz().then(b=>setBusinesses(b)).catch(()=>{});
+    db.getAllBizNos().then(b=>setBusinesses(b)).catch(()=>{});
   },[]);
   useEffect(()=>{ refresh(); const id=setInterval(refresh,30000); return()=>clearInterval(id); },[refresh]);
   const showToast=(m)=>{ setToast(m); setTimeout(()=>setToast(""),2800); };
@@ -2438,12 +2474,18 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
   const [selId, setSelId] = useState(null);
   const [form, setForm] = useState({name:"",email:"",phone:"",password:"",memo:"",status:"approved"});
   const [saving, setSaving] = useState(false);
+  // 사업자 편집
+  const [newBizNo, setNewBizNo] = useState("");
+  const [newBizName, setNewBizName] = useState("");
+  const [addingBiz, setAddingBiz] = useState(false);
 
   const selUser = users.find(u=>u.id===selId);
   const selectUser = (u) => {
     setSelId(u.id);
     setForm({ name:u.name||"", email:u.email||"", phone:u.phone||"", password:"", memo:u.memo||"", status:u.status||"approved" });
+    setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
   };
+
   const save = () => {
     if(!selId) return;
     setSaving(true);
@@ -2451,6 +2493,30 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
       .then(()=>{ onRefresh(); showToast("저장되었습니다."); setSaving(false); })
       .catch(()=>{ showToast("저장 중 오류가 발생했습니다."); setSaving(false); });
   };
+
+  const addBiz = async () => {
+    if(!newBizNo.trim()){ showToast("사업자번호를 입력하세요."); return; }
+    const trimmed = newBizNo.trim();
+    const bizName = newBizName.trim() || trimmed;
+    try {
+      // businesses 테이블에 등록
+      await db.addBiz(trimmed, { name:bizName, type:"개인", representative:form.name });
+      // user_businesses 연결
+      const current = selUser?.businesses || [];
+      if(!current.includes(trimmed)){
+        await db.setBizList(selId, [...current, trimmed]);
+      }
+      setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
+      onRefresh(); showToast("사업자번호가 추가되었습니다.");
+    } catch(e) { showToast("오류가 발생했습니다."); }
+  };
+
+  const removeBiz = async (biz) => {
+    const current = selUser?.businesses || [];
+    await db.setBizList(selId, current.filter(b=>b!==biz)).catch(()=>{});
+    onRefresh();
+  };
+
   const statusColors = {approved:[T.green,T.greenLight],pending:[T.orange,T.orangeLight],rejected:[T.red,T.redLight]};
   const selStyle = {padding:"10px 14px",borderRadius:T.radiusSm,border:`1.5px solid ${T.border}`,background:"rgba(255,255,255,0.9)",color:T.text,fontSize:"14px",fontFamily:T.font,outline:"none",width:"100%",boxSizing:"border-box"};
 
@@ -2469,8 +2535,7 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
               <div key={u.id} onClick={()=>selectUser(u)} style={{
                 padding:"11px 14px",borderRadius:T.radiusSm,cursor:"pointer",marginBottom:"4px",
                 background:selId===u.id?T.blueLight:"rgba(0,0,0,0.02)",
-                border:`1.5px solid ${selId===u.id?T.blue:T.border}`,
-                transition:"all 0.15s",
+                border:`1.5px solid ${selId===u.id?T.blue:T.border}`,transition:"all 0.15s",
               }}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                   <span style={{color:T.text,fontWeight:"600",fontSize:"14px"}}>{u.name}</span>
@@ -2481,10 +2546,13 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
             );
           })}
         </Card>
+
         {/* 편집 폼 */}
         {selUser ? (
           <Card style={{padding:"28px"}}>
             <p style={{color:T.textSub,fontSize:"11px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.8px",margin:"0 0 18px"}}>{selUser.name} 정보 수정</p>
+
+            {/* 기본 정보 */}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px",marginBottom:"12px"}}>
               <div><Label>이름</Label><Input value={form.name} onChange={v=>setForm(x=>({...x,name:v}))}/></div>
               <div><Label>연락처</Label><Input value={form.phone} onChange={v=>setForm(x=>({...x,phone:v}))} placeholder="010-0000-0000"/></div>
@@ -2503,9 +2571,36 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
               <textarea value={form.memo} onChange={e=>setForm(x=>({...x,memo:e.target.value}))} placeholder="관리자 메모"
                 style={{width:"100%",padding:"10px 14px",borderRadius:T.radiusSm,border:`1.5px solid ${T.border}`,background:"rgba(255,255,255,0.9)",color:T.text,fontSize:"14px",fontFamily:T.font,outline:"none",resize:"none",height:"72px",boxSizing:"border-box"}}/>
             </div>
-            <div style={{display:"flex",gap:"10px"}}>
-              <Btn onClick={save} disabled={saving}>{saving?"저장 중…":"저장하기"}</Btn>
+            <div style={{display:"flex",gap:"10px",marginBottom:"28px"}}>
+              <Btn onClick={save} disabled={saving}>{saving?"저장 중…":"기본정보 저장"}</Btn>
               <Btn onClick={()=>setSelId(null)} variant="secondary">취소</Btn>
+            </div>
+
+            {/* 사업자번호 관리 */}
+            <div style={{borderTop:`1px solid ${T.border}`,paddingTop:"20px"}}>
+              <p style={{color:T.textSub,fontSize:"11px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.8px",margin:"0 0 12px"}}>연결된 사업자번호</p>
+              <div style={{display:"flex",flexWrap:"wrap",gap:"6px",marginBottom:"10px"}}>
+                {(selUser.businesses||[]).length===0&&<span style={{color:T.textMuted,fontSize:"13px"}}>등록된 사업자번호 없음</span>}
+                {(selUser.businesses||[]).map(biz=>(
+                  <span key={biz} style={{display:"inline-flex",alignItems:"center",gap:"5px",background:T.blueLight,color:T.blue,fontSize:"12px",fontWeight:"600",padding:"5px 12px",borderRadius:"20px"}}>
+                    <span>{businesses[biz]?.name||biz}</span>
+                    <span style={{color:T.textMuted,fontSize:"11px"}}>({biz})</span>
+                    <button onClick={()=>removeBiz(biz)} style={{background:"none",border:"none",color:T.red,cursor:"pointer",padding:"0 0 0 4px",display:"inline-flex",alignItems:"center",fontSize:"14px",lineHeight:1}}>×</button>
+                  </span>
+                ))}
+              </div>
+              {addingBiz ? (
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr auto auto",gap:"8px",alignItems:"end"}}>
+                  <div><Label>사업자번호 *</Label><Input value={newBizNo} onChange={setNewBizNo} placeholder="000-00-00000"/></div>
+                  <div><Label>상호명 (선택)</Label><Input value={newBizName} onChange={setNewBizName} placeholder="(주)예시"/></div>
+                  <Btn onClick={addBiz} size="sm">추가</Btn>
+                  <Btn onClick={()=>{setAddingBiz(false);setNewBizNo("");setNewBizName("");}} variant="secondary" size="sm">취소</Btn>
+                </div>
+              ) : (
+                <button onClick={()=>setAddingBiz(true)} style={{background:"none",border:`1px dashed ${T.borderStrong}`,color:T.blue,padding:"6px 16px",borderRadius:"8px",cursor:"pointer",fontSize:"13px",fontFamily:T.font,fontWeight:"600"}}>
+                  + 사업자번호 추가
+                </button>
+              )}
             </div>
           </Card>
         ) : (
