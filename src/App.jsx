@@ -2489,8 +2489,9 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
   const [newBizNo, setNewBizNo] = useState("");
   const [newBizName, setNewBizName] = useState("");
   const [addingBiz, setAddingBiz] = useState(false);
-  // 로컬 사업자 목록 — onRefresh 대기 없이 즉시 반영
   const [localBizList, setLocalBizList] = useState([]);
+  // onRefresh로 users가 갱신될 때 덮어쓰기 방지 플래그
+  const skipSync = useRef(false);
 
   const selUser = users.find(u=>u.id===selId);
 
@@ -2499,10 +2500,12 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
     setLocalBizList(u.businesses||[]);
     setForm({ name:u.name||"", email:u.email||"", phone:u.phone||"", password:"", memo:u.memo||"", status:u.status||"approved" });
     setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
+    skipSync.current = false;
   };
 
-  // users 변경(onRefresh 완료) 시 로컬 목록 동기화
+  // users 변경 시 동기화 — skipSync가 true이면 무시
   useEffect(()=>{
+    if(skipSync.current) return;
     if(selId) {
       const u = users.find(u=>u.id===selId);
       if(u) setLocalBizList(u.businesses||[]);
@@ -2522,22 +2525,36 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
     const trimmed = newBizNo.trim();
     const bizName = newBizName.trim() || trimmed;
     try {
-      await db.addBiz(trimmed, { name:bizName, type:"개인", representative:form.name });
+      // 1. 즉시 로컬 화면 반영 (덮어쓰기 방지 플래그 ON)
       const updated = localBizList.includes(trimmed) ? localBizList : [...localBizList, trimmed];
-      await db.setBizList(selId, updated);
-      // 즉시 로컬 상태 반영
+      skipSync.current = true;
       setLocalBizList(updated);
       setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
-      onRefresh();
       showToast("사업자번호가 추가되었습니다.");
-    } catch(e) { showToast("오류가 발생했습니다: "+e.message); }
+      // 2. 백그라운드 DB 저장
+      await db.addBiz(trimmed, { name:bizName, type:"개인", representative:form.name });
+      await db.setBizList(selId, updated);
+      // 3. DB 저장 완료 후 플래그 해제 + 갱신
+      skipSync.current = false;
+      onRefresh();
+    } catch(e) {
+      skipSync.current = false;
+      showToast("오류가 발생했습니다: "+e.message);
+    }
   };
 
   const removeBiz = async (biz) => {
     const updated = localBizList.filter(b=>b!==biz);
-    setLocalBizList(updated); // 즉시 로컬 반영
-    await db.setBizList(selId, updated).catch(()=>{});
-    onRefresh();
+    skipSync.current = true;
+    setLocalBizList(updated);
+    try {
+      await db.setBizList(selId, updated);
+      skipSync.current = false;
+      onRefresh();
+    } catch(e) {
+      skipSync.current = false;
+      showToast("삭제 중 오류가 발생했습니다.");
+    }
   };
 
   const statusColors = {approved:[T.green,T.greenLight],pending:[T.orange,T.orangeLight],rejected:[T.red,T.redLight]};
