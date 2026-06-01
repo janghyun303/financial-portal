@@ -217,7 +217,7 @@ const supaPatch = (table, query, body) =>
   supa(`${table}?${query}`, { method:"PATCH", body:JSON.stringify(body), prefer:"return=representation" });
 // UPSERT
 const supaUpsert = (table, body) =>
-  supa(table, { method:"POST", body:JSON.stringify(body), headers:{ Prefer:"resolution=merge-duplicates,return=representation" } });
+  supa(table, { method:"POST", body:JSON.stringify(body), headers:{ "Prefer":"resolution=merge-duplicates,return=representation", "Content-Type":"application/json" } });
 
 const db = {
   // ── 이메일 존재 확인 (비밀번호 찾기용)
@@ -302,6 +302,13 @@ const db = {
     await supaPatch("users", `id=eq.${id}`, body);
   },
 
+  // ── 회원 삭제
+  deleteUser: async (id) => {
+    // user_businesses 연결 먼저 삭제
+    await supa(`user_businesses?user_id=eq.${id}`, { method:"DELETE", prefer:"" });
+    await supa(`users?id=eq.${id}`, { method:"DELETE", prefer:"" });
+  },
+
   // ── 회원 상태 변경
   setStatus: async (id, status) => {
     await supaPatch("users", `id=eq.${id}`, { status });
@@ -383,145 +390,109 @@ const FK = (n) => {
 };
 
 /* ─────────────────────────────────────────
-   위하고 Excel 파서
-   ┌ 재무상태표/손익계산서: 5컬럼 구조
-   │  col0=과목  col1=당기세부  col2=당기순액  col3=전기세부  col4=전기순액
-   │  → col2(당기 순액/합계), col4(전기 순액/합계) 사용
-   ├ 부가세신고: 기수/매출세액/매입세액/납부세액
-   └ 법인세신고: 과세표준/산출세액/납부세액
+   위하고 Excel 파서 — 행별 동적 컬럼 선택
+   위하고T 실제 구조:
+     합계/소계행 → col2(당기합계), col4(전기합계)
+     세부항목행  → col1(당기세부), col3(전기세부)
+     감가상각누계행 → col2(당기순액), col4(전기순액) + 직전 자산행 순액 보정
 ───────────────────────────────────────── */
 const parseExcel = (buffer, docType) => {
   const wb = XLSX.read(buffer, { type: "array" });
   const ws = wb.Sheets[wb.SheetNames[0]];
-  // raw:true 로 숫자를 숫자형으로 받음
-  const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:"", raw:true });
+  const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:"", raw:false });
 
-  // 숫자 정제: 숫자형이면 그대로, 문자면 쉼표·괄호 처리
   const toNum = (v) => {
     if(v===null||v===undefined||v==="") return 0;
     if(typeof v === "number") return v;
     const s = String(v).replace(/,/g,"").replace(/\s/g,"").replace(/원/g,"");
-    // (음수) 표기 처리
     const neg = s.match(/^\((.+)\)$/);
     const n = parseFloat(neg ? neg[1] : s);
     return isNaN(n) ? 0 : (neg ? -n : n);
   };
-
+  const hasV = (v) => v !== null && v !== undefined && String(v).trim() !== "" && String(v).trim() !== "0";
   if (docType === "재무상태표" || docType === "손익계산서") {
-    /*
-     * 위하고T 5컬럼 구조:
-     *   [0] 과목
-     *   [1] 당기 세부금액(취득액 등) ← 무시
-     *   [2] 당기 순액/합계           ← colCurrent
-     *   [3] 전기 세부금액(취득액 등) ← 무시
-     *   [4] 전기 순액/합계           ← colPrev
-     *
-     * 일반 3컬럼 구조(과목/당기/전기)도 지원.
-     */
-    let headerRow0 = -1; // 당기·전기 기간 텍스트가 있는 행
-    let headerRow1 = -1; // "금액" 서브헤더 행 (있는 경우)
-    let dataStart  = -1;
-    let colAccount = 0, colCurrent = 2, colPrev = 4; // 기본: 5컬럼
-
-    // ── 헤더 행 탐색
-    for (let i = 0; i < Math.min(raw.length, 20); i++) {
+    let dataStart = 0;
+    for (let i = 0; i < Math.min(raw.length, 15); i++) {
       const row = raw[i].map(c => String(c).trim());
-      // "과목" 또는 "계정과목" 헤더 행
       if (row.some(c => /^(과\s*목|계정과목|항\s*목)$/.test(c))) {
-        headerRow1 = i;
-        dataStart  = i + 1;
-        colAccount = row.findIndex(c => /^(과\s*목|계정과목|항\s*목)$/.test(c));
-        break;
-      }
-      // 당기/전기 기간 텍스트 행
-      if (row.some(c => /당.*기|전.*기/.test(c))) {
-        headerRow0 = i;
+        dataStart = i + 1; break;
       }
     }
-
-    // 폴백: 첫 행을 헤더로
-    if (dataStart < 0) { dataStart = 1; colAccount = 0; }
-
-    // ── 실제 컬럼 수로 당기/전기 위치 결정
-    // 데이터 첫 유효 행을 찾아 컬럼 수 확인
-    let sampleRow = null;
-    for (let i = dataStart; i < Math.min(raw.length, dataStart + 10); i++) {
-      if (raw[i] && raw[i].some(v => v !== "" && v !== null)) {
-        sampleRow = raw[i]; break;
-      }
-    }
-    const totalCols = sampleRow ? sampleRow.length : 3;
-
-    if (totalCols >= 5) {
-      // 5컬럼: [0]과목 [1]당기세부 [2]당기순액 [3]전기세부 [4]전기순액
-      colAccount = 0; colCurrent = 2; colPrev = 4;
-    } else if (totalCols >= 3) {
-      // 3컬럼: [0]과목 [1]당기 [2]전기
-      colAccount = 0; colCurrent = 1; colPrev = 2;
+    // "금액" 서브헤더 행 스킵
+    if (dataStart < raw.length) {
+      const sub = raw[dataStart].map(c => String(c).trim());
+      if (sub.every(c => c === "" || /^금\s*액$/.test(c))) dataStart++;
     }
 
-    // ── 헤더 텍스트에서 당기/전기 컬럼 위치 재확인 (혹시 컬럼 순서가 다를 때)
-    if (headerRow0 >= 0) {
-      const hRow = raw[headerRow0].map(c => String(c).trim());
-      const curIdxs  = hRow.reduce((a,c,i)=>{ if(/당.*기/.test(c)) a.push(i); return a; }, []);
-      const prevIdxs = hRow.reduce((a,c,i)=>{ if(/전.*기/.test(c)) a.push(i); return a; }, []);
-      if (curIdxs.length && prevIdxs.length) {
-        // 당기 그룹의 마지막 컬럼 = 순액, 전기 그룹의 마지막 컬럼 = 순액
-        // (헤더가 병합셀이라 보통 첫 번째 인덱스만 잡힘 → 그 다음 그룹 시작 직전이 순액)
-        const curBase  = curIdxs[0];
-        const prevBase = prevIdxs[0];
-        if (curBase < prevBase) {
-          colCurrent = prevBase - 1;  // 전기 시작 직전 = 당기 순액
-          colPrev    = prevBase + (prevBase - curBase) - 1; // 전기 순액
-          // 안전장치: 범위 초과 시 기본값 유지
-          if (colCurrent <= colAccount) { colCurrent = curBase + 1; }
-          if (colPrev    >= totalCols)  { colPrev = totalCols - 1; }
-        }
-      }
-    }
-
-    // ── 기간 텍스트 추출
+    // 기간 텍스트
     let 기간 = "";
-    for (let i = 0; i <= Math.max(headerRow0, 0); i++) {
-      const line = raw[i].map(c=>String(c)).join(" ");
+    for (let i = 0; i < Math.min(dataStart, raw.length); i++) {
+      const line = raw[i].join(" ");
       if (/20\d{2}/.test(line)) { 기간 = line.replace(/\s+/g," ").trim(); break; }
     }
 
-    // ── 행 분류 키워드
-    const totalKw    = /총계|합\s*계|순이익|당기순|자본총|부채총|자산총|부채및자본총계/;
+    const totalKw    = /총계|당기순이익|순이익|자본총|부채총|자산총|부채및자본총계/;
     const subtotalKw = /총이익|영업이익|차감전|소\s*계|매출총이익/;
-    const skipKw     = /^(자산|부채|자본)$|감가상각누계액|대손충당금|^\(당기순이익\)/;
-    // 감가상각누계액 행은 순액(col2/col4)에 이미 반영되어 있으므로 스킵
+    const skipKw     = /^(자산|부채|자본)$/;
+    const accumKw    = /감가상각누계액|대손충당금/;
 
     const rows = [];
+    let pendingIdx = -1; // 취득액만 있고 순액 미확정인 유형자산 행 인덱스
 
     for (let i = dataStart; i < raw.length; i++) {
       const row = raw[i];
-      if (!row || row.every(v => v === "" || v === null)) continue;
+      if (!row || row.every(v => v === "" || v === null)) { pendingIdx = -1; continue; }
 
-      const acRaw = String(row[colAccount] || "").trim();
+      const acRaw = String(row[0] || "").trim();
       if (!acRaw || acRaw === "0") continue;
-      // 스킵 대상 행
-      if (skipKw.test(acRaw)) continue;
-      // 순수 날짜/메모 행 스킵 (당기: … 원 형태)
       if (/^(당기|전기)\s*:/.test(acRaw)) continue;
+      if (/^\(당기순이익\)$/.test(acRaw)) { pendingIdx = -1; continue; }
+      if (skipKw.test(acRaw)) { pendingIdx = -1; continue; }
 
-      // 당기·전기 순액 읽기
-      const cur  = toNum(row[colCurrent]);
-      const prev = toNum(row[colPrev]);
+      // 감가상각누계액 행 → 직전 pendingIdx 자산행 순액 보정 후 스킵
+      if (accumKw.test(acRaw)) {
+        if (pendingIdx >= 0) {
+          const netCur  = toNum(row[2]);
+          const netPrev = toNum(row[4]);
+          if (netCur !== 0 || netPrev !== 0) {
+            rows[pendingIdx].당기 = netCur;
+            rows[pendingIdx].전기 = netPrev;
+          }
+          pendingIdx = -1;
+        }
+        continue;
+      }
 
-      // 둘 다 0이고 짧은 텍스트면 섹션 구분자일 수 있어 스킵
-      if (cur === 0 && prev === 0 && acRaw.length <= 2) continue;
+      // 행별 동적 컬럼 선택
+      const v1 = row[1], v2 = row[2], v3 = row[3], v4 = row[4];
+      let cur = 0, prev = 0;
+      let isPending = false;
 
-      // 들여쓰기로 레벨 판정
-      const rawAc = String(row[colAccount] || "");
-      const leadSpace = (rawAc.match(/^(\s+)/) || ["",""])[1].length;
-      const level = leadSpace > 8 ? 2 : leadSpace > 2 ? 1 : 0;
+      if (hasV(v2) || hasV(v4)) {
+        // 합계/그룹/일반 세부 행 (col2·col4에 값)
+        cur  = toNum(v2);
+        prev = toNum(v4);
+        pendingIdx = -1;
+      } else if (hasV(v1) || hasV(v3)) {
+        // 세부항목 행 (col1·col3에만 값) — 손익계산서 세부 또는 유형자산 취득액
+        cur  = toNum(v1);
+        prev = toNum(v3);
+        isPending = true; // 재무상태표에서 다음 누계액 행으로 순액 보정 대기
+      } else {
+        continue;
+      }
+
+      const rawAc = String(row[0] || "");
+      const lead  = (rawAc.match(/^(\s+)/) || ["",""])[1].length;
+      const level = lead > 10 ? 2 : lead > 3 ? 1 : 0;
 
       let type = "item";
-      if (totalKw.test(acRaw))    type = "total";
+      if (totalKw.test(acRaw))         type = "total";
       else if (subtotalKw.test(acRaw)) type = "subtotal";
-      else if (level === 0)        type = "header";
+      else if (level === 0)            type = "header";
+
+      if (isPending) pendingIdx = rows.length;
+      else pendingIdx = -1;
 
       rows.push({ 계정과목: acRaw, 당기: cur, 전기: prev, level, type });
     }
@@ -629,8 +600,9 @@ const Btn = ({ children, onClick, variant="primary", disabled=false, size="md", 
   return <button onClick={disabled?undefined:onClick} style={{...base,...sizes[size],...variants[variant]}}>{children}</button>;
 };
 
-const Input = ({ value, onChange, placeholder, type="text", style={} }) => (
+const Input = ({ value, onChange, placeholder, type="text", style={}, onKeyDown }) => (
   <input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder}
+    onKeyDown={onKeyDown}
     style={{width:"100%",padding:"10px 14px",borderRadius:T.radiusSm,border:`1.5px solid ${T.border}`,background:"rgba(255,255,255,0.9)",color:T.text,fontSize:"14px",fontFamily:T.font,outline:"none",boxSizing:"border-box",transition:"border-color 0.15s",...style}}
     onFocus={e=>e.target.style.borderColor=T.blue}
     onBlur={e=>e.target.style.borderColor=T.border}
@@ -2025,9 +1997,10 @@ const MENUS = [
 function CustomerDash({ user, onLogout }) {
   const isMobile = useIsMobile();
   const [biz,setBiz]=useState(user.businesses?.[0]||"");
-  const [year,setYear]=useState("2024");
+  const [year,setYear]=useState("");           // ← 빈 문자열로 시작, getYears 후 자동 설정
   const [menu,setMenu]=useState("재무상태표");
   const [bizInfo,setBizInfo]=useState(null);
+  const [allBizInfo,setAllBizInfo]=useState({}); // ← 전체 사업자 정보 캐시 (모바일 BottomSheet용)
   const [years,setYears]=useState([]);
   const [sidebar,setSidebar]=useState(true);
   const [sheetOpen,setSheetOpen]=useState(false);
@@ -2035,19 +2008,31 @@ function CustomerDash({ user, onLogout }) {
   const [prevDoc,setPrevDoc]=useState(null);
   const [loading,setLoading]=useState(false);
 
+  // 최초 마운트 시 전체 사업자 정보 로드 (모바일 사업자 목록 표시용)
+  useEffect(()=>{
+    if(!user.businesses?.length) return;
+    Promise.all(user.businesses.map(b=>db.getBiz(b).catch(()=>null)))
+      .then(results=>{
+        const m={};
+        user.businesses.forEach((b,i)=>{ if(results[i]) m[b]=results[i]; });
+        setAllBizInfo(m);
+      });
+  },[]);
+
   // 사업자 변경 시 기본 정보 로드
   useEffect(()=>{
     if(!biz) return;
     db.getBiz(biz).then(info=>setBizInfo(info)).catch(()=>{});
     db.getYears(biz).then(ys=>{
       setYears(ys);
-      if(ys.length && !ys.includes(year)) setYear(ys[0]);
+      // 현재 연도가 목록에 없으면 첫 번째 연도로 자동 설정
+      if(ys.length) setYear(prev => ys.includes(prev) ? prev : ys[0]);
     }).catch(()=>{});
   },[biz]);
 
   // 메뉴/연도/사업자 변경 시 데이터 로드
   useEffect(()=>{
-    if(!biz || menu==="세금일정") { setDoc(null); setPrevDoc(null); return; }
+    if(!biz || !year || menu==="세금일정") { setDoc(null); setPrevDoc(null); return; }
     setLoading(true);
     const prevYear = year ? String(Number(year)-1) : null;
     Promise.all([
@@ -2114,7 +2099,7 @@ function CustomerDash({ user, onLogout }) {
           <div style={{marginBottom:"20px"}}>
             <p style={{color:T.textSub,fontSize:"12px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.6px",margin:"0 0 10px"}}>사업자 선택</p>
             {user.businesses.map(b=>{
-              const info=db.getBiz(b);
+              const info=allBizInfo[b];
               return (
                 <button key={b} onClick={()=>{setBiz(b);setSheetOpen(false);}} style={{
                   width:"100%",textAlign:"left",padding:"12px 14px",borderRadius:T.radiusSm,
@@ -2389,8 +2374,8 @@ function AdminDash({ user, onLogout }) {
             ))}
           </div>
           {TABS.map(t=>(
-            <button key={t.id} onClick={()=>setTab(t.id)} style={{width:"100%",textAlign:"left",padding:"9px 12px",borderRadius:T.radiusSm,border:"none",cursor:"pointer",fontSize:"13px",fontFamily:T.font,fontWeight:tab===t.id?"600":"400",marginBottom:"2px",display:"flex",alignItems:"center",gap:"8px",justifyContent:"space-between",background:tab===t.id?"rgba(0,113,227,0.1)":"transparent",color:tab===t.id?T.blue:T.textSub}}>
-              <span style={{display:"flex",alignItems:"center",gap:"8px"}}><Icon name={t.icon} size={14} color={tab===t.id?T.blue:T.textMuted}/><span>{t.label}</span></span>
+            <button key={t.id} onClick={()=>setTab(t.id)} style={{width:"100%",textAlign:"left",padding:"9px 12px",borderRadius:T.radiusSm,border:"none",cursor:"pointer",fontSize:"13px",fontFamily:T.font,fontWeight:tab===t.id?"700":"600",marginBottom:"2px",display:"flex",alignItems:"center",gap:"8px",justifyContent:"space-between",background:tab===t.id?"rgba(255,255,255,0.12)":"transparent",color:tab===t.id?"#FFFFFF":"rgba(255,255,255,0.85)"}}>
+              <span style={{display:"flex",alignItems:"center",gap:"8px"}}><Icon name={t.icon} size={14} color={tab===t.id?"#FFFFFF":"rgba(255,255,255,0.7)"}/><span>{t.label}</span></span>
               {t.badge>0&&<span style={{background:T.red,color:"#fff",fontSize:"10px",fontWeight:"700",padding:"1px 6px",borderRadius:"10px"}}>{t.badge}</span>}
             </button>
           ))}
@@ -2440,6 +2425,11 @@ function MembersPanel({ users, businesses, onRefresh, showToast }) {
                 <Btn onClick={()=>{db.setStatus(u.id,"rejected").then(()=>{onRefresh();showToast("거절되었습니다.");}).catch(()=>showToast("오류가 발생했습니다."));}} variant="secondary" size="sm" style={{color:T.red}}>거절</Btn>
               </div>
             )}
+            {/* 삭제 버튼 — 항상 표시 */}
+            <Btn onClick={()=>{
+              if(!window.confirm(`"${u.name}" 회원을 삭제하시겠습니까?\n삭제 시 복구가 불가능합니다.`)) return;
+              db.deleteUser(u.id).then(()=>{onRefresh();showToast("삭제되었습니다.");}).catch(()=>showToast("삭제 중 오류가 발생했습니다."));
+            }} variant="secondary" size="sm" style={{color:T.red,border:`1px solid ${T.red}`,marginLeft:"4px"}}>삭제</Btn>
           </div>
           <div style={{marginTop:"14px",paddingTop:"14px",borderTop:`1px solid ${T.border}`}}>
             <p style={{color:T.textMuted,fontSize:"10px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.6px",margin:"0 0 8px"}}>연결된 사업자</p>
