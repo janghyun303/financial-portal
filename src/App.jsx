@@ -269,13 +269,15 @@ const db = {
 
   // ── 전체 사업자번호 목록 (user_businesses 포함 — 업로드 패널용)
   getAllBizNos: async () => {
-    // businesses 테이블 + user_businesses에 있지만 businesses에 없는 것도 포함
-    const bizRows = await supaGet("businesses", "select=*&order=name");
-    const ubRows  = await supaGet("user_businesses", "select=biz_no");
     const bizMap = {};
-    (bizRows||[]).forEach(r=>{ bizMap[r.biz_no]={ name:r.name, type:r.type, representative:r.representative }; });
-    // user_businesses에만 있는 사업자번호 추가 (상호 미등록 상태)
-    (ubRows||[]).forEach(r=>{ if(!bizMap[r.biz_no]) bizMap[r.biz_no]={ name:r.biz_no, type:"-", representative:"" }; });
+    try {
+      const bizRows = await supaGet("businesses", "select=*&order=name");
+      (bizRows||[]).forEach(r=>{ bizMap[r.biz_no]={ name:r.name||r.biz_no, type:r.type||"-", representative:r.representative||"" }; });
+    } catch(e) { console.warn("businesses 테이블 조회 실패:", e.message); }
+    try {
+      const ubRows = await supaGet("user_businesses", "select=biz_no");
+      (ubRows||[]).forEach(r=>{ if(!bizMap[r.biz_no]) bizMap[r.biz_no]={ name:r.biz_no, type:"-", representative:"" }; });
+    } catch(e) { console.warn("user_businesses 테이블 조회 실패:", e.message); }
     return bizMap;
   },
 
@@ -1901,12 +1903,27 @@ function TaxCalendar({ biz, bizInfo }) {
 /* ─────────────────────────────────────────
    관리자 업로드 패널
 ───────────────────────────────────────── */
-function UploadPanel({ businesses, onRefresh, showToast }) {
+function UploadPanel({ businesses: bizProp, onRefresh, showToast }) {
   const [bizNo,setBizNo]=useState("");
-  const [year,setYear]=useState("2024");
+  const [year,setYear]=useState("2025");
   const [docType,setDocType]=useState("재무상태표");
   const [parsed,setParsed]=useState(null);
   const [preview,setPreview]=useState(false);
+  // 사업자 목록을 직접 로드 (부모 prop 실패 대비)
+  const [businesses,setBusinesses]=useState(bizProp||{});
+  const [bizLoading,setBizLoading]=useState(false);
+  const [bizErr,setBizErr]=useState("");
+
+  const loadBiz = () => {
+    setBizLoading(true); setBizErr("");
+    db.getAllBizNos()
+      .then(b=>{ setBusinesses(b); setBizLoading(false); if(Object.keys(b).length===0) setBizErr("등록된 사업자가 없습니다. 사업자 탭에서 먼저 등록하거나, 회원가입 시 사업자번호를 입력해주세요."); })
+      .catch(e=>{ setBizLoading(false); setBizErr("사업자 목록 로드 실패: "+e.message); });
+  };
+
+  // 마운트 + prop 변경 시마다 항상 직접 재조회
+  useEffect(()=>{ loadBiz(); },[]);
+  useEffect(()=>{ if(bizProp && Object.keys(bizProp).length>0) setBusinesses(bizProp); },[bizProp]);
 
   const handleParsed=(data)=>{ setParsed(data); setPreview(true); };
   const handleSave=()=>{
@@ -1917,6 +1934,7 @@ function UploadPanel({ businesses, onRefresh, showToast }) {
   };
 
   const selStyle={padding:"10px 14px",borderRadius:T.radiusSm,border:`1.5px solid ${T.border}`,background:"rgba(255,255,255,0.9)",color:T.text,fontSize:"14px",fontFamily:T.font,outline:"none",width:"100%",boxSizing:"border-box"};
+  const bizList = Object.entries(businesses);
 
   return (
     <div>
@@ -1938,16 +1956,21 @@ function UploadPanel({ businesses, onRefresh, showToast }) {
       <Card style={{padding:"28px",marginBottom:"20px"}}>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"14px",marginBottom:"20px"}}>
           <div>
-            <Label>사업자</Label>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"6px"}}>
+              <Label>사업자</Label>
+              <button onClick={loadBiz} style={{background:"none",border:"none",color:T.blue,fontSize:"11px",cursor:"pointer",fontFamily:T.font,padding:0,fontWeight:"600"}}>{bizLoading?"로딩…":"↻ 새로고침"}</button>
+            </div>
             <select value={bizNo} onChange={e=>setBizNo(e.target.value)} style={selStyle}>
-              <option value="">선택</option>
-              {Object.entries(businesses).map(([no,info])=><option key={no} value={no}>{info.name}</option>)}
+              <option value="">{bizLoading?"로딩 중…":"선택"}</option>
+              {bizList.map(([no,info])=><option key={no} value={no}>{info.name||no} ({no})</option>)}
             </select>
+            {bizErr&&<p style={{color:T.red,fontSize:"11px",margin:"5px 0 0",lineHeight:1.4}}>{bizErr}</p>}
+            {!bizLoading&&bizList.length===0&&!bizErr&&<p style={{color:T.orange,fontSize:"11px",margin:"5px 0 0"}}>사업자 없음 — 사업자 탭에서 추가하거나 새로고침을 눌러주세요.</p>}
           </div>
           <div>
             <Label>사업연도</Label>
             <select value={year} onChange={e=>setYear(e.target.value)} style={selStyle}>
-              {["2025","2024","2023","2022","2021"].map(y=><option key={y} value={y}>{y}년</option>)}
+              {["2026","2025","2024","2023","2022","2021"].map(y=><option key={y} value={y}>{y}년</option>)}
             </select>
           </div>
           <div>
