@@ -2371,7 +2371,7 @@ function AdminDash({ user, onLogout }) {
   useEffect(()=>{ refresh(); const id=setInterval(refresh,30000); return()=>clearInterval(id); },[refresh]);
   const showToast=(m)=>{ setToast(m); setTimeout(()=>setToast(""),2800); };
   const pending=users.filter(u=>u.status==="pending").length;
-  const TABS=[{id:"upload",label:"업로드",icon:"upload"},{id:"members",label:"회원 관리",icon:"users",badge:pending},{id:"businesses",label:"사업자",icon:"building"},{id:"edit",label:"회원 정보 수정",icon:"settings"}];
+  const TABS=[{id:"upload",label:"업로드",icon:"upload"},{id:"members",label:"회원 관리",icon:"users",badge:pending},{id:"edit",label:"회원 정보 수정",icon:"settings"}];
 
   return (
     <div style={{minHeight:"100vh",background:T.bg,fontFamily:T.font}}>
@@ -2406,7 +2406,6 @@ function AdminDash({ user, onLogout }) {
         <main style={{flex:1,padding:"28px",overflow:"auto"}}>
           {tab==="upload"&&<UploadPanel businesses={businesses} onRefresh={refresh} showToast={showToast}/>}
           {tab==="members"&&<MembersPanel users={users} businesses={businesses} onRefresh={refresh} showToast={showToast}/>}
-          {tab==="businesses"&&<BizPanel businesses={businesses} onRefresh={refresh} showToast={showToast}/>}
           {tab==="edit"&&<EditMembersPanel users={users} businesses={businesses} onRefresh={refresh} showToast={showToast}/>}
         </main>
       </div>
@@ -2487,17 +2486,28 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
   const [selId, setSelId] = useState(null);
   const [form, setForm] = useState({name:"",email:"",phone:"",password:"",memo:"",status:"approved"});
   const [saving, setSaving] = useState(false);
-  // 사업자 편집
   const [newBizNo, setNewBizNo] = useState("");
   const [newBizName, setNewBizName] = useState("");
   const [addingBiz, setAddingBiz] = useState(false);
+  // 로컬 사업자 목록 — onRefresh 대기 없이 즉시 반영
+  const [localBizList, setLocalBizList] = useState([]);
 
   const selUser = users.find(u=>u.id===selId);
+
   const selectUser = (u) => {
     setSelId(u.id);
+    setLocalBizList(u.businesses||[]);
     setForm({ name:u.name||"", email:u.email||"", phone:u.phone||"", password:"", memo:u.memo||"", status:u.status||"approved" });
     setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
   };
+
+  // users 변경(onRefresh 완료) 시 로컬 목록 동기화
+  useEffect(()=>{
+    if(selId) {
+      const u = users.find(u=>u.id===selId);
+      if(u) setLocalBizList(u.businesses||[]);
+    }
+  },[users, selId]);
 
   const save = () => {
     if(!selId) return;
@@ -2512,21 +2522,21 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
     const trimmed = newBizNo.trim();
     const bizName = newBizName.trim() || trimmed;
     try {
-      // businesses 테이블에 등록
       await db.addBiz(trimmed, { name:bizName, type:"개인", representative:form.name });
-      // user_businesses 연결
-      const current = selUser?.businesses || [];
-      if(!current.includes(trimmed)){
-        await db.setBizList(selId, [...current, trimmed]);
-      }
+      const updated = localBizList.includes(trimmed) ? localBizList : [...localBizList, trimmed];
+      await db.setBizList(selId, updated);
+      // 즉시 로컬 상태 반영
+      setLocalBizList(updated);
       setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
-      onRefresh(); showToast("사업자번호가 추가되었습니다.");
-    } catch(e) { showToast("오류가 발생했습니다."); }
+      onRefresh();
+      showToast("사업자번호가 추가되었습니다.");
+    } catch(e) { showToast("오류가 발생했습니다: "+e.message); }
   };
 
   const removeBiz = async (biz) => {
-    const current = selUser?.businesses || [];
-    await db.setBizList(selId, current.filter(b=>b!==biz)).catch(()=>{});
+    const updated = localBizList.filter(b=>b!==biz);
+    setLocalBizList(updated); // 즉시 로컬 반영
+    await db.setBizList(selId, updated).catch(()=>{});
     onRefresh();
   };
 
@@ -2555,6 +2565,9 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
                   <span style={{background:sb,color:sc,fontSize:"10px",fontWeight:"700",padding:"2px 8px",borderRadius:"20px"}}>{u.status==="approved"?"승인":u.status==="pending"?"대기":"거절"}</span>
                 </div>
                 <p style={{color:T.textSub,fontSize:"12px",margin:"2px 0 0"}}>{u.email}</p>
+                {(u.businesses||[]).length>0&&(
+                  <p style={{color:T.textMuted,fontSize:"11px",margin:"3px 0 0"}}>사업자 {u.businesses.length}개</p>
+                )}
               </div>
             );
           })}
@@ -2565,7 +2578,6 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
           <Card style={{padding:"28px"}}>
             <p style={{color:T.textSub,fontSize:"11px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.8px",margin:"0 0 18px"}}>{selUser.name} 정보 수정</p>
 
-            {/* 기본 정보 */}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px",marginBottom:"12px"}}>
               <div><Label>이름</Label><Input value={form.name} onChange={v=>setForm(x=>({...x,name:v}))}/></div>
               <div><Label>연락처</Label><Input value={form.phone} onChange={v=>setForm(x=>({...x,phone:v}))} placeholder="010-0000-0000"/></div>
@@ -2592,26 +2604,53 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
             {/* 사업자번호 관리 */}
             <div style={{borderTop:`1px solid ${T.border}`,paddingTop:"20px"}}>
               <p style={{color:T.textSub,fontSize:"11px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.8px",margin:"0 0 12px"}}>연결된 사업자번호</p>
-              <div style={{display:"flex",flexWrap:"wrap",gap:"6px",marginBottom:"10px"}}>
-                {(selUser.businesses||[]).length===0&&<span style={{color:T.textMuted,fontSize:"13px"}}>등록된 사업자번호 없음</span>}
-                {(selUser.businesses||[]).map(biz=>(
-                  <span key={biz} style={{display:"inline-flex",alignItems:"center",gap:"5px",background:T.blueLight,color:T.blue,fontSize:"12px",fontWeight:"600",padding:"5px 12px",borderRadius:"20px"}}>
-                    <span>{businesses[biz]?.name||biz}</span>
-                    <span style={{color:T.textMuted,fontSize:"11px"}}>({biz})</span>
-                    <button onClick={()=>removeBiz(biz)} style={{background:"none",border:"none",color:T.red,cursor:"pointer",padding:"0 0 0 4px",display:"inline-flex",alignItems:"center",fontSize:"14px",lineHeight:1}}>×</button>
+
+              {/* 등록된 사업자번호 태그 목록 */}
+              <div style={{display:"flex",flexWrap:"wrap",gap:"8px",marginBottom:"14px",minHeight:"32px"}}>
+                {localBizList.length===0 && !addingBiz && (
+                  <span style={{color:T.textMuted,fontSize:"13px",lineHeight:"32px"}}>등록된 사업자번호 없음</span>
+                )}
+                {localBizList.map(biz=>(
+                  <span key={biz} style={{
+                    display:"inline-flex",alignItems:"center",gap:"6px",
+                    background:T.blueLight,border:`1px solid rgba(30,95,173,0.2)`,
+                    color:T.blue,fontSize:"13px",fontWeight:"600",
+                    padding:"6px 14px",borderRadius:"20px",
+                  }}>
+                    <span>{businesses[biz]?.name && businesses[biz].name!==biz ? businesses[biz].name : ""}</span>
+                    {businesses[biz]?.name && businesses[biz].name!==biz
+                      ? <span style={{color:T.textMuted,fontSize:"11px",fontWeight:"400"}}>({biz})</span>
+                      : <span>{biz}</span>
+                    }
+                    <button onClick={()=>removeBiz(biz)} style={{
+                      background:"none",border:"none",color:T.red,cursor:"pointer",
+                      padding:"0",marginLeft:"2px",display:"inline-flex",alignItems:"center",
+                      fontSize:"16px",lineHeight:1,fontWeight:"700",
+                    }}>×</button>
                   </span>
                 ))}
               </div>
+
+              {/* 추가 폼 */}
               {addingBiz ? (
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr auto auto",gap:"8px",alignItems:"end"}}>
-                  <div><Label>사업자번호 *</Label><Input value={newBizNo} onChange={setNewBizNo} placeholder="000-00-00000"/></div>
-                  <div><Label>상호명 (선택)</Label><Input value={newBizName} onChange={setNewBizName} placeholder="(주)예시"/></div>
-                  <Btn onClick={addBiz} size="sm">추가</Btn>
-                  <Btn onClick={()=>{setAddingBiz(false);setNewBizNo("");setNewBizName("");}} variant="secondary" size="sm">취소</Btn>
+                <div style={{background:"rgba(0,0,0,0.02)",border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"16px"}}>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px",marginBottom:"10px"}}>
+                    <div><Label>사업자번호 *</Label><Input value={newBizNo} onChange={setNewBizNo} placeholder="000-00-00000" onKeyDown={ev=>ev.key==="Enter"&&addBiz()}/></div>
+                    <div><Label>상호명 (선택)</Label><Input value={newBizName} onChange={setNewBizName} placeholder="예: (주)한국상사" onKeyDown={ev=>ev.key==="Enter"&&addBiz()}/></div>
+                  </div>
+                  <div style={{display:"flex",gap:"8px"}}>
+                    <Btn onClick={addBiz} size="sm">추가하기</Btn>
+                    <Btn onClick={()=>{setAddingBiz(false);setNewBizNo("");setNewBizName("");}} variant="secondary" size="sm">취소</Btn>
+                  </div>
                 </div>
               ) : (
-                <button onClick={()=>setAddingBiz(true)} style={{background:"none",border:`1px dashed ${T.borderStrong}`,color:T.blue,padding:"6px 16px",borderRadius:"8px",cursor:"pointer",fontSize:"13px",fontFamily:T.font,fontWeight:"600"}}>
-                  + 사업자번호 추가
+                <button onClick={()=>setAddingBiz(true)} style={{
+                  background:"none",border:`1.5px dashed ${T.blue}`,color:T.blue,
+                  padding:"8px 18px",borderRadius:"8px",cursor:"pointer",
+                  fontSize:"13px",fontFamily:T.font,fontWeight:"600",
+                  display:"flex",alignItems:"center",gap:"6px",
+                }}>
+                  <span style={{fontSize:"16px",lineHeight:1}}>+</span> 사업자번호 추가
                 </button>
               )}
             </div>
