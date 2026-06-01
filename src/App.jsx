@@ -2498,19 +2498,10 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
   const selectUser = (u) => {
     setSelId(u.id);
     setLocalBizList(u.businesses||[]);
+    skipSync.current = false;
     setForm({ name:u.name||"", email:u.email||"", phone:u.phone||"", password:"", memo:u.memo||"", status:u.status||"approved" });
     setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
-    skipSync.current = false;
   };
-
-  // users 변경 시 동기화 — skipSync가 true이면 무시
-  useEffect(()=>{
-    if(skipSync.current) return;
-    if(selId) {
-      const u = users.find(u=>u.id===selId);
-      if(u) setLocalBizList(u.businesses||[]);
-    }
-  },[users, selId]);
 
   const save = () => {
     if(!selId) return;
@@ -2524,22 +2515,19 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
     if(!newBizNo.trim()){ showToast("사업자번호를 입력하세요."); return; }
     const trimmed = newBizNo.trim();
     const bizName = newBizName.trim() || trimmed;
+    // 1. 즉시 화면 반영
+    const updated = localBizList.includes(trimmed) ? localBizList : [...localBizList, trimmed];
+    skipSync.current = true;
+    setLocalBizList(updated);
+    setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
+    showToast("사업자번호가 추가되었습니다.");
+    // 2. 백그라운드 DB 저장 (완료 후에도 skipSync 유지 — 30초 타이머가 덮어쓰지 못하게)
     try {
-      // 1. 즉시 로컬 화면 반영 (덮어쓰기 방지 플래그 ON)
-      const updated = localBizList.includes(trimmed) ? localBizList : [...localBizList, trimmed];
-      skipSync.current = true;
-      setLocalBizList(updated);
-      setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
-      showToast("사업자번호가 추가되었습니다.");
-      // 2. 백그라운드 DB 저장
       await db.addBiz(trimmed, { name:bizName, type:"개인", representative:form.name });
+      // DELETE 후 INSERT 구조이므로 최신 updated 기준으로 저장
       await db.setBizList(selId, updated);
-      // 3. DB 저장 완료 후 플래그 해제 + 갱신
-      skipSync.current = false;
-      onRefresh();
     } catch(e) {
-      skipSync.current = false;
-      showToast("오류가 발생했습니다: "+e.message);
+      showToast("DB 저장 오류: "+e.message);
     }
   };
 
@@ -2549,10 +2537,7 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
     setLocalBizList(updated);
     try {
       await db.setBizList(selId, updated);
-      skipSync.current = false;
-      onRefresh();
     } catch(e) {
-      skipSync.current = false;
       showToast("삭제 중 오류가 발생했습니다.");
     }
   };
