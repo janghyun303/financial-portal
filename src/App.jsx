@@ -267,17 +267,23 @@ const db = {
     return { ok:true };
   },
 
-  // ── 전체 사업자번호 목록 (user_businesses 포함 — 업로드 패널용)
+  // ── 전체 사업자번호 목록 (승인된 회원 연결분 포함 — 업로드 패널용)
   getAllBizNos: async () => {
     const bizMap = {};
     try {
+      // businesses 테이블 전체
       const bizRows = await supaGet("businesses", "select=*&order=name");
       (bizRows||[]).forEach(r=>{ bizMap[r.biz_no]={ name:r.name||r.biz_no, type:r.type||"-", representative:r.representative||"" }; });
-    } catch(e) { console.warn("businesses 테이블 조회 실패:", e.message); }
+    } catch(e) { console.warn("businesses 조회 실패:", e.message); }
     try {
-      const ubRows = await supaGet("user_businesses", "select=biz_no");
-      (ubRows||[]).forEach(r=>{ if(!bizMap[r.biz_no]) bizMap[r.biz_no]={ name:r.biz_no, type:"-", representative:"" }; });
-    } catch(e) { console.warn("user_businesses 테이블 조회 실패:", e.message); }
+      // 승인된 회원의 user_businesses만 추가
+      const approvedUsers = await supaGet("users", "status=eq.approved&select=id");
+      const approvedIds = (approvedUsers||[]).map(u=>u.id);
+      if(approvedIds.length) {
+        const ubRows = await supaGet("user_businesses", `user_id=in.(${approvedIds.join(",")})&select=biz_no`);
+        (ubRows||[]).forEach(r=>{ if(!bizMap[r.biz_no]) bizMap[r.biz_no]={ name:r.biz_no, type:"-", representative:"" }; });
+      }
+    } catch(e) { console.warn("user_businesses 조회 실패:", e.message); }
     return bizMap;
   },
 
@@ -773,9 +779,12 @@ function Register({ onGo }) {
     if(f.pw.length<6){setErr("비밀번호는 6자 이상이어야 합니다.");return;}
     const vb=bizs.filter(b=>b.no.trim());
     if(!vb.length){setErr("사업자번호를 1개 이상 입력해주세요.");return;}
+    // 상호명 필수 검증
+    const noName=vb.find(b=>!b.name.trim());
+    if(noName){setErr(`사업자번호 "${noName.no}"의 상호명을 입력해주세요.`);return;}
     setL(true);
-    const bizNames = {};
-    vb.forEach(b=>{ if(b.name.trim()) bizNames[b.no.trim()]=b.name.trim(); });
+    const bizNames={};
+    vb.forEach(b=>{ bizNames[b.no.trim()]=b.name.trim(); });
     db.register({name:f.name,email:f.email,password:f.pw,phone:f.phone,memo:f.memo,businesses:vb.map(b=>b.no.trim()),bizNames})
       .then(r=>{ setL(false); if(r.ok) setOk(true); else setErr(r.msg); })
       .catch(()=>{ setL(false); setErr("서버 연결 오류가 발생했습니다."); });
@@ -818,8 +827,8 @@ function Register({ onGo }) {
           </div>
           {bizs.map((biz,i)=>(
             <div key={i} style={{display:"flex",gap:"8px",alignItems:"flex-end",marginBottom:"8px"}}>
-              <div style={{flex:1}}><Label>사업자번호</Label><Input value={biz.no} onChange={v=>{const nb=[...bizs];nb[i].no=v;setBizs(nb)}} placeholder="000-00-00000"/></div>
-              <div style={{flex:1}}><Label>상호 (선택)</Label><Input value={biz.name} onChange={v=>{const nb=[...bizs];nb[i].name=v;setBizs(nb)}} placeholder="(주)한국상사"/></div>
+              <div style={{flex:1}}><Label>사업자번호 *</Label><Input value={biz.no} onChange={v=>{const nb=[...bizs];nb[i].no=v;setBizs(nb)}} placeholder="000-00-00000"/></div>
+              <div style={{flex:1}}><Label>상호명 *</Label><Input value={biz.name} onChange={v=>{const nb=[...bizs];nb[i].name=v;setBizs(nb)}} placeholder="(주)한국상사"/></div>
               {bizs.length>1&&<button onClick={()=>setBizs(b=>b.filter((_,idx)=>idx!==i))} style={{background:T.redLight,border:"none",color:T.red,padding:"10px 12px",borderRadius:T.radiusSm,cursor:"pointer",fontWeight:"700",marginBottom:"1px",fontSize:"14px",lineHeight:1}}>×</button>}
             </div>
           ))}
@@ -2489,18 +2498,26 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
   const [newBizNo, setNewBizNo] = useState("");
   const [newBizName, setNewBizName] = useState("");
   const [addingBiz, setAddingBiz] = useState(false);
-  const [localBizList, setLocalBizList] = useState([]);
-  // onRefresh로 users가 갱신될 때 덮어쓰기 방지 플래그
-  const skipSync = useRef(false);
+  // DB에서 직접 읽는 사업자 목록 — users prop 변화에 영향받지 않음
+  const [bizList, setBizList] = useState([]);
+  const [bizLoading, setBizLoading] = useState(false);
 
   const selUser = users.find(u=>u.id===selId);
 
+  const loadBizList = async (userId) => {
+    setBizLoading(true);
+    try {
+      const rows = await supaGet("user_businesses", `user_id=eq.${userId}&select=biz_no`);
+      setBizList((rows||[]).map(r=>r.biz_no));
+    } catch(e) { console.warn(e); }
+    setBizLoading(false);
+  };
+
   const selectUser = (u) => {
     setSelId(u.id);
-    setLocalBizList(u.businesses||[]);
-    skipSync.current = false;
     setForm({ name:u.name||"", email:u.email||"", phone:u.phone||"", password:"", memo:u.memo||"", status:u.status||"approved" });
     setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
+    loadBizList(u.id);
   };
 
   const save = () => {
@@ -2515,31 +2532,21 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
     if(!newBizNo.trim()){ showToast("사업자번호를 입력하세요."); return; }
     const trimmed = newBizNo.trim();
     const bizName = newBizName.trim() || trimmed;
-    // 1. 즉시 화면 반영
-    const updated = localBizList.includes(trimmed) ? localBizList : [...localBizList, trimmed];
-    skipSync.current = true;
-    setLocalBizList(updated);
-    setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
-    showToast("사업자번호가 추가되었습니다.");
-    // 2. 백그라운드 DB 저장 (완료 후에도 skipSync 유지 — 30초 타이머가 덮어쓰지 못하게)
     try {
       await db.addBiz(trimmed, { name:bizName, type:"개인", representative:form.name });
-      // DELETE 후 INSERT 구조이므로 최신 updated 기준으로 저장
-      await db.setBizList(selId, updated);
-    } catch(e) {
-      showToast("DB 저장 오류: "+e.message);
-    }
+      await supaUpsert("user_businesses", { user_id:selId, biz_no:trimmed });
+      setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
+      await loadBizList(selId);
+      showToast("사업자번호가 추가되었습니다.");
+    } catch(e) { showToast("오류: "+e.message); }
   };
 
   const removeBiz = async (biz) => {
-    const updated = localBizList.filter(b=>b!==biz);
-    skipSync.current = true;
-    setLocalBizList(updated);
     try {
-      await db.setBizList(selId, updated);
-    } catch(e) {
-      showToast("삭제 중 오류가 발생했습니다.");
-    }
+      await supa(`user_businesses?user_id=eq.${selId}&biz_no=eq.${encodeURIComponent(biz)}`, { method:"DELETE", prefer:"" });
+      await loadBizList(selId);
+      showToast("삭제되었습니다.");
+    } catch(e) { showToast("삭제 오류: "+e.message); }
   };
 
   const statusColors = {approved:[T.green,T.greenLight],pending:[T.orange,T.orangeLight],rejected:[T.red,T.redLight]};
@@ -2550,7 +2557,6 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
       <h2 style={{color:T.text,fontSize:"20px",fontWeight:"700",margin:"0 0 6px",letterSpacing:"-0.7px"}}>회원 정보 수정</h2>
       <p style={{color:T.textSub,fontSize:"14px",margin:"0 0 20px"}}>회원을 선택한 후 정보를 수정하세요.</p>
       <div style={{display:"grid",gridTemplateColumns:"260px 1fr",gap:"20px",alignItems:"start"}}>
-        {/* 회원 목록 */}
         <Card style={{padding:"16px",maxHeight:"600px",overflow:"auto"}}>
           <p style={{color:T.textSub,fontSize:"11px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.8px",margin:"0 0 12px"}}>회원 목록</p>
           {users.length===0&&<p style={{color:T.textMuted,fontSize:"13px"}}>가입자가 없습니다.</p>}
@@ -2567,19 +2573,14 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
                   <span style={{background:sb,color:sc,fontSize:"10px",fontWeight:"700",padding:"2px 8px",borderRadius:"20px"}}>{u.status==="approved"?"승인":u.status==="pending"?"대기":"거절"}</span>
                 </div>
                 <p style={{color:T.textSub,fontSize:"12px",margin:"2px 0 0"}}>{u.email}</p>
-                {(u.businesses||[]).length>0&&(
-                  <p style={{color:T.textMuted,fontSize:"11px",margin:"3px 0 0"}}>사업자 {u.businesses.length}개</p>
-                )}
               </div>
             );
           })}
         </Card>
 
-        {/* 편집 폼 */}
         {selUser ? (
           <Card style={{padding:"28px"}}>
             <p style={{color:T.textSub,fontSize:"11px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.8px",margin:"0 0 18px"}}>{selUser.name} 정보 수정</p>
-
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px",marginBottom:"12px"}}>
               <div><Label>이름</Label><Input value={form.name} onChange={v=>setForm(x=>({...x,name:v}))}/></div>
               <div><Label>연락처</Label><Input value={form.phone} onChange={v=>setForm(x=>({...x,phone:v}))} placeholder="010-0000-0000"/></div>
@@ -2603,42 +2604,28 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
               <Btn onClick={()=>setSelId(null)} variant="secondary">취소</Btn>
             </div>
 
-            {/* 사업자번호 관리 */}
             <div style={{borderTop:`1px solid ${T.border}`,paddingTop:"20px"}}>
               <p style={{color:T.textSub,fontSize:"11px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.8px",margin:"0 0 12px"}}>연결된 사업자번호</p>
-
-              {/* 등록된 사업자번호 태그 목록 */}
               <div style={{display:"flex",flexWrap:"wrap",gap:"8px",marginBottom:"14px",minHeight:"32px"}}>
-                {localBizList.length===0 && !addingBiz && (
-                  <span style={{color:T.textMuted,fontSize:"13px",lineHeight:"32px"}}>등록된 사업자번호 없음</span>
-                )}
-                {localBizList.map(biz=>(
-                  <span key={biz} style={{
-                    display:"inline-flex",alignItems:"center",gap:"6px",
-                    background:T.blueLight,border:`1px solid rgba(30,95,173,0.2)`,
-                    color:T.blue,fontSize:"13px",fontWeight:"600",
-                    padding:"6px 14px",borderRadius:"20px",
-                  }}>
-                    <span>{businesses[biz]?.name && businesses[biz].name!==biz ? businesses[biz].name : ""}</span>
-                    {businesses[biz]?.name && businesses[biz].name!==biz
-                      ? <span style={{color:T.textMuted,fontSize:"11px",fontWeight:"400"}}>({biz})</span>
-                      : <span>{biz}</span>
-                    }
-                    <button onClick={()=>removeBiz(biz)} style={{
-                      background:"none",border:"none",color:T.red,cursor:"pointer",
-                      padding:"0",marginLeft:"2px",display:"inline-flex",alignItems:"center",
-                      fontSize:"16px",lineHeight:1,fontWeight:"700",
-                    }}>×</button>
-                  </span>
-                ))}
+                {bizLoading&&<span style={{color:T.textMuted,fontSize:"13px"}}>불러오는 중…</span>}
+                {!bizLoading&&bizList.length===0&&!addingBiz&&<span style={{color:T.textMuted,fontSize:"13px"}}>등록된 사업자번호 없음</span>}
+                {!bizLoading&&bizList.map(biz=>{
+                  const info = businesses[biz];
+                  const hasName = info?.name && info.name !== biz;
+                  return (
+                    <span key={biz} style={{display:"inline-flex",alignItems:"center",gap:"6px",background:T.blueLight,border:`1px solid rgba(30,95,173,0.2)`,color:T.blue,fontSize:"13px",fontWeight:"600",padding:"6px 14px",borderRadius:"20px"}}>
+                      {hasName&&<span>{info.name}</span>}
+                      <span style={{color:hasName?T.textMuted:T.blue,fontSize:hasName?"11px":"13px"}}>{hasName?`(${biz})`:biz}</span>
+                      <button onClick={()=>removeBiz(biz)} style={{background:"none",border:"none",color:T.red,cursor:"pointer",padding:"0",marginLeft:"2px",fontSize:"16px",lineHeight:1,fontWeight:"700"}}>×</button>
+                    </span>
+                  );
+                })}
               </div>
-
-              {/* 추가 폼 */}
               {addingBiz ? (
                 <div style={{background:"rgba(0,0,0,0.02)",border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"16px"}}>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px",marginBottom:"10px"}}>
                     <div><Label>사업자번호 *</Label><Input value={newBizNo} onChange={setNewBizNo} placeholder="000-00-00000" onKeyDown={ev=>ev.key==="Enter"&&addBiz()}/></div>
-                    <div><Label>상호명 (선택)</Label><Input value={newBizName} onChange={setNewBizName} placeholder="예: (주)한국상사" onKeyDown={ev=>ev.key==="Enter"&&addBiz()}/></div>
+                    <div><Label>상호명</Label><Input value={newBizName} onChange={setNewBizName} placeholder="(주)한국상사" onKeyDown={ev=>ev.key==="Enter"&&addBiz()}/></div>
                   </div>
                   <div style={{display:"flex",gap:"8px"}}>
                     <Btn onClick={addBiz} size="sm">추가하기</Btn>
@@ -2646,12 +2633,7 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
                   </div>
                 </div>
               ) : (
-                <button onClick={()=>setAddingBiz(true)} style={{
-                  background:"none",border:`1.5px dashed ${T.blue}`,color:T.blue,
-                  padding:"8px 18px",borderRadius:"8px",cursor:"pointer",
-                  fontSize:"13px",fontFamily:T.font,fontWeight:"600",
-                  display:"flex",alignItems:"center",gap:"6px",
-                }}>
+                <button onClick={()=>setAddingBiz(true)} style={{background:"none",border:`1.5px dashed ${T.blue}`,color:T.blue,padding:"8px 18px",borderRadius:"8px",cursor:"pointer",fontSize:"13px",fontFamily:T.font,fontWeight:"600",display:"flex",alignItems:"center",gap:"6px"}}>
                   <span style={{fontSize:"16px",lineHeight:1}}>+</span> 사업자번호 추가
                 </button>
               )}
