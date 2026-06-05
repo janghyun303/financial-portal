@@ -257,11 +257,19 @@ const db = {
       for (const biz_no of data.businesses) {
         const trimmed = biz_no.trim();
         if (!trimmed) continue;
-        // user_businesses 테이블에 연결
-        await supaPost("user_businesses", { user_id:userId, biz_no:trimmed }).catch(()=>{});
-        // businesses 테이블에도 등록 (상호명 미입력 시 사업자번호를 임시 상호로)
+        // businesses 테이블 등록
         const bizName = (data.bizNames && data.bizNames[trimmed]) || trimmed;
-        await supaUpsert("businesses", { biz_no:trimmed, name:bizName, type:"개인", representative:data.name||"" }).catch(()=>{});
+        await supaPost("businesses", { biz_no:trimmed, name:bizName, type:"개인", representative:data.name||"" })
+          .catch(async ()=>{
+            // 중복이면 이름만 업데이트
+            await supaPatch("businesses", `biz_no=eq.${encodeURIComponent(trimmed)}`, { name:bizName }).catch(()=>{});
+          });
+        // user_businesses 등록 (중복 방지)
+        const existing = await supaGet("user_businesses",
+          `user_id=eq.${userId}&biz_no=eq.${encodeURIComponent(trimmed)}&select=user_id`).catch(()=>[]);
+        if (!existing?.length) {
+          await supaPost("user_businesses", { user_id:userId, biz_no:trimmed }).catch(()=>{});
+        }
       }
     }
     return { ok:true };
@@ -348,10 +356,10 @@ const db = {
   // ── 사업자 추가
   addBiz: async (no, info) => {
     try {
-      await supaUpsert("businesses", { biz_no:no, name:info.name, type:info.type, representative:info.representative||"" });
+      await supaPost("businesses", { biz_no:no, name:info.name||no, type:info.type||"개인", representative:info.representative||"" });
     } catch(e) {
-      // 중복 키 오류(409) 등은 무시하고 PATCH로 재시도
-      await supaPatch("businesses", `biz_no=eq.${encodeURIComponent(no)}`, { name:info.name, type:info.type, representative:info.representative||"" });
+      // 중복(409) — PATCH로 이름만 업데이트
+      await supaPatch("businesses", `biz_no=eq.${encodeURIComponent(no)}`, { name:info.name||no, type:info.type||"개인", representative:info.representative||"" }).catch(()=>{});
     }
   },
 
@@ -2533,12 +2541,24 @@ function EditMembersPanel({ users, businesses, onRefresh, showToast }) {
     const trimmed = newBizNo.trim();
     const bizName = newBizName.trim() || trimmed;
     try {
+      // businesses 테이블 등록 (중복이면 PATCH로 이름 업데이트)
       await db.addBiz(trimmed, { name:bizName, type:"개인", representative:form.name });
-      await supaUpsert("user_businesses", { user_id:selId, biz_no:trimmed });
+
+      // user_businesses: 이미 있는지 확인 후 없으면 INSERT
+      const existing = await supaGet("user_businesses",
+        `user_id=eq.${selId}&biz_no=eq.${encodeURIComponent(trimmed)}&select=user_id`);
+      if (!existing?.length) {
+        await supaPost("user_businesses", { user_id:selId, biz_no:trimmed });
+      }
+
       setNewBizNo(""); setNewBizName(""); setAddingBiz(false);
       await loadBizList(selId);
       showToast("사업자번호가 추가되었습니다.");
-    } catch(e) { showToast("오류: "+e.message); }
+    } catch(e) {
+      let msg = e.message;
+      try { const j = JSON.parse(msg); msg = j.message || j.hint || msg; } catch(_){}
+      showToast("오류: " + msg);
+    }
   };
 
   const removeBiz = async (biz) => {
