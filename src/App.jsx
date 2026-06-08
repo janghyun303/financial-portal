@@ -377,9 +377,18 @@ const db = {
     return [...new Set((rows||[]).map(r=>r.year))];
   },
 
-  // ── 재무 데이터 저장 (upsert)
+  // ── 재무 데이터 저장 (POST → 중복이면 PATCH)
   saveDoc: async (no, yr, type, data) => {
-    await supaUpsert("financial_docs", { biz_no:no, year:yr, doc_type:type, data });
+    try {
+      await supaPost("financial_docs", { biz_no:no, year:yr, doc_type:type, data });
+    } catch(e) {
+      // 이미 존재하면 PATCH로 덮어쓰기
+      await supaPatch(
+        "financial_docs",
+        `biz_no=eq.${encodeURIComponent(no)}&year=eq.${encodeURIComponent(yr)}&doc_type=eq.${encodeURIComponent(type)}`,
+        { data }
+      );
+    }
   },
 };
 
@@ -1947,7 +1956,11 @@ function UploadPanel({ businesses: bizProp, onRefresh, showToast }) {
     if(!bizNo||!parsed){showToast("사업자와 파일을 선택해주세요.");return;}
     db.saveDoc(bizNo,year,docType,parsed)
       .then(()=>{ showToast("저장 완료 — 고객이 즉시 조회 가능합니다."); setParsed(null); setPreview(false); if(onRefresh) onRefresh(); })
-      .catch(()=>showToast("저장 중 오류가 발생했습니다."));
+      .catch(e=>{
+        let msg = e?.message || "저장 중 오류가 발생했습니다.";
+        try { const j=JSON.parse(msg); msg=j.message||j.hint||msg; } catch(_){}
+        showToast("업로드 실패: "+msg);
+      });
   };
 
   const selStyle={padding:"10px 14px",borderRadius:T.radiusSm,border:`1.5px solid ${T.border}`,background:"rgba(255,255,255,0.9)",color:T.text,fontSize:"14px",fontFamily:T.font,outline:"none",width:"100%",boxSizing:"border-box"};
